@@ -1,5 +1,7 @@
 # ASCII Animals
 
+![ASCII Animals as a new tab page: koi, butterflies and jellyfish drawn from keyboard characters drift behind a search box](store/preview-browser.gif)
+
 Swarms of animals drawn from keyboard characters. One folder, one engine (`engine.js`), two hosts. No dependencies, and no build step to run it (packaging for the stores is under Publishing).
 
 ## Install
