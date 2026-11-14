@@ -19,16 +19,19 @@
   (function () {
     var pending = Object.fromEntries(new URLSearchParams(location.search));
     var engine = null, fps = 0;
+    var paint = function (s) { document.body.style.background = AsciiAnimals.backgroundOf(s).css; }; // behind the canvas
     window.wallpaperPropertyListener = {
       applyUserProperties: function (props) {
         var s = AsciiAnimals.fromWallpaperProps(props);
-        if (engine) engine.update(s); else Object.assign(pending, s);
+        Object.assign(pending, s); paint(pending);
+        if (engine) engine.update(s);
       },
       // The user's FPS limit from the Wallpaper Engine performance settings (a number, e.g. 30).
       applyGeneralProperties: function (props) {
         if (props && props.fps) { fps = props.fps; if (engine) engine.setFps(fps); }
       }
     };
+    paint(pending);
     engine = AsciiAnimals.start(document.getElementById('bg'), pending);
     engine.setFps(fps);
   })();

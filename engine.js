@@ -31,6 +31,7 @@
     ['trailFade', 'Trail fade', 'Look', 0.05, 6, 0.05, 0.15],
     ['grid', 'Grid', 'Look', 0, 4, 0.05, 1.05],
     ['detail', 'ASCII detail', 'Look', 0.5, 2, 0.05, 1.3],
+    ['background', 'Background', 'Look', 0, 1, 0.01, 0], // 0 = the near-black background, 1 = white, in between neutral greys
     ['blur', 'Blur (px)', 'Chat glass', 0, 30, 0.5, 3.5],
     ['refraction', 'Refraction', 'Chat glass', 0, 150, 1, 40],
     ['ripple', 'Ripple', 'Chat glass', 0.001, 0.04, 0.001, 0.007],
@@ -827,6 +828,41 @@
   const mix = (c, d, t) => c.map((v, i) => Math.round(v + (d[i] - v) * t));
   const css = (c) => 'rgb(' + c.join(',') + ')';
 
+  // ---------- background tone ----------
+  // Background 0..1 mixes the near-black BG toward white (linear in sRGB). Everything light-on-dark (bare glyphs, eye tiles,
+  // ripple dots, the grid lines, the new-tab text) is derived from it once per tone (lookOf is memoised): adapt(c) keeps the
+  // contrast colour c has on the default background, on this one, using whichever side (lighter or darker than the
+  // background) is chosen by the background's luminance. Black and white contrast equally with a luminance of 0.179 (4.58:1),
+  // so the side flips there and the best available contrast never drops below that.
+  const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const unlin = (v) => Math.round(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
+  const lumOf = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+  const contrast = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const LUM0 = lumOf(BGC), GRID_K = [132, 141, 172]; // the grid line colour is the background shifted by GRID_K (BGC + GRID_K = 140,150,185)
+  const LOOKS = new Map();
+  function lookOf(tone) {
+    let L = LOOKS.get(tone);
+    if (L) return L;
+    const rgb = mix(BGC, [255, 255, 255], tone), lum = lumOf(rgb), light = lum > 0.1791, sg = light ? -1 : 1;
+    L = {
+      tone, rgb, css: css(rgb), light, lum,
+      grid: rgb.map((v, i) => clamp(v + sg * GRID_K[i], 0, 255)), // the colour the grid lines blend toward
+      lit: light ? [10, 10, 14] : [255, 255, 255], // shimmer / sparkle push tiles toward this
+      pupil: light ? [238, 238, 238] : [12, 12, 14],
+      adapt: tone === 0 ? (c) => c : (c) => {
+        const Lc = lumOf(c), Cd = Math.max(1, (Lc + 0.05) / (LUM0 + 0.05));
+        const T = light ? Math.max(0, (lum + 0.05) / Cd - 0.05) : Math.min(1, Cd * (lum + 0.05) - 0.05); // luminance with the same contrast
+        return c.map((v) => { v = lin(v); return unlin(T > Lc ? v + ((1 - v) * (T - Lc)) / (1 - Lc) : Lc ? (v * T) / Lc : 0); });
+      },
+    };
+    L.ripple = css(L.adapt([200, 204, 216]));
+    LOOKS.set(tone, L);
+    return L;
+  }
+  const LOOK0 = lookOf(0);
+  // The background of these settings (any shape normalize accepts): { rgb, css, light, lum, adapt(rgb) } for hosts that draw UI over the canvas.
+  const backgroundOf = (settings) => lookOf(normalize(settings).background);
+
   // Hue shift: the CSS hue-rotate() matrix.
   function hueRotate(c, deg) {
     if (!deg) return c;
@@ -838,10 +874,13 @@
   }
   // The tile colour of a cell: Hue shift, depth fade (halo and eye tiles differ), then the lit variants: 0 plain,
   // 1 shimmer-lit, 2 sparkle.
-  function cellColor(sp, code, dim, hue, variant) {
+  function cellColor(sp, code, dim, hue, variant, look) {
+    look = look || LOOK0;
     const kind = code >> 16;
-    const col = mix(kind === EYE ? [238, 238, 238] : hueRotate(hex(sp.P.cols[(code >> 8) & 255]), hue), BGC, kind === HALO ? 0.55 + dim * 0.4 : dim);
-    return variant ? mix(col, [255, 255, 255], variant === 1 ? 0.3 : 0.8) : col;
+    let c = kind === EYE ? [238, 238, 238] : hueRotate(hex(sp.P.cols[(code >> 8) & 255]), hue);
+    if (kind === BARE || kind === EYE) c = look.adapt(c); // light-on-dark parts stay readable on a light background; tiles keep their colour
+    const col = mix(c, look.rgb, kind === HALO ? 0.55 + dim * 0.4 : dim);
+    return variant ? mix(col, look.lit, variant === 1 ? 0.3 : 0.8) : col;
   }
   // Shimmer: a slow band of lighter tiles drifting across the swarm; Sparkle: single tiles flashing near-white.
   // The look of a cell right now: 0 plain, 1 shimmer-lit, 2 sparkle (tiles only).
@@ -852,8 +891,8 @@
   }
   // Pre-rendered cells (tile + glyph per colour, depth, glyph and variant: 0 plain, 1 shimmer-lit, 2 sparkle) in
   // fixed-size pages, filled on first use. Bounded: when every slot is used it starts over. Rebuilt when the species,
-  // cell size, DPR, hue or depth fade changes.
-  function makeAtlas(sp, gw, gh, levels, hue) {
+  // cell size, DPR, hue, background or depth fade changes.
+  function makeAtlas(sp, gw, gh, levels, hue, look) {
     const PER = 32, MAX = PER * PER * 4, pages = [], map = new Map(); // pages are created on demand, at most 4
     let n = 0;
     const font = (k) => k * gw + 'px Menlo, Consolas, "DejaVu Sans Mono", "Courier New", monospace';
@@ -864,7 +903,7 @@
       const kind = code >> 16, g = code & 255, dim = levels[lvl].dim;
       x.clearRect(sx, sy, gw, gh);
       x.textAlign = 'center'; x.textBaseline = 'middle';
-      const col = cellColor(sp, code, dim, hue, variant);
+      const col = cellColor(sp, code, dim, hue, variant, look);
       const gap = Math.max(1, Math.round(gw * 0.13)), tw = gw - gap, th = gh - gap, mx = sx + gw / 2, my = sy + gh / 2;
       const glyph = (color, k) => {
         x.fillStyle = css(color);
@@ -876,7 +915,7 @@
       x.beginPath();
       if (x.roundRect) x.roundRect(sx + gap / 2, sy + gap / 2, tw, th, tw * 0.18); else x.rect(sx + gap / 2, sy + gap / 2, tw, th);
       x.fill();
-      if (kind === EYE) { x.fillStyle = css(mix([12, 12, 14], BGC, dim)); x.beginPath(); x.ellipse(mx, my, tw * 0.3, th * 0.26, 0, 0, TAU); x.fill(); return; }
+      if (kind === EYE) { x.fillStyle = css(mix(look.pupil, look.rgb, dim)); x.beginPath(); x.ellipse(mx, my, tw * 0.3, th * 0.26, 0, 0, TAU); x.fill(); return; }
       if (!g) return;
       const lum = (0.3 * col[0] + 0.59 * col[1] + 0.11 * col[2]) / 255;
       glyph(sp.glyph ? sp.glyph(col) : lum > 0.4 ? mix(col, [0, 0, 0], 0.6) : mix(col, [255, 255, 255], 0.42), 0.85);
@@ -903,7 +942,7 @@
     const ctx = canvas.getContext('2d');
     const raw = {};
     const merge = (p) => { for (const k in p) if (p[k] !== undefined) raw[k] = p[k]; };
-    let dpr = 0, gw = 0, gh = 0, last = 0, raf = 0, grid = null, atlas = null, fps = 0, sig = '';
+    let dpr = 0, gw = 0, gh = 0, last = 0, raf = 0, grid = null, atlas = null, fps = 0, sig = '', look = LOOK0;
     // Reduced motion: slowest speed and no click scatter (koi food is still fine). matchMedia is absent in node.
     const mq = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
     let reduce = !!(mq && mq.matches);
@@ -914,11 +953,12 @@
     const world = createWorld(s, animal, window.innerWidth, window.innerHeight, Math.random);
     const settle = () => {
       configure(world, s, animal);
+      look = lookOf(s.background);
       if (reduce) world.speed = LIMITS.speed[0] / DEFAULTS.speed;
       const d = dpr || 1;
       const w = Math.max(4, Math.round(world.cw * d)), h = Math.max(5, Math.round(world.ch * d));
       // whole device pixels per cell keep tiles crisp; the atlas and grid follow species, cell size, DPR and look
-      const k = [world.animal, w, h, s.hue, s.grid, world.levels.map((l) => l.dim).join()].join('|');
+      const k = [world.animal, w, h, s.hue, s.background, s.grid, world.levels.map((l) => l.dim).join()].join('|');
       if (k !== sig) { sig = k; gw = w; gh = h; atlas = null; grid = null; }
       world.u *= gw / d / world.cw; // bodies keep their size in cells when the cell is snapped (or floored) to whole device pixels
       world.cw = gw / d; world.ch = gh / d;
@@ -943,8 +983,8 @@
         const t = document.createElement('canvas');
         t.width = gw; t.height = gh;
         const x = t.getContext('2d');
-        x.fillStyle = BG; x.fillRect(0, 0, gw, gh); // opaque tile: one fill paints background and grid
-        x.fillStyle = 'rgba(140,150,185,' + 0.03 * (s.grid / DEFAULTS.grid) + ')'; // default: ~4 levels over the background, like the reference
+        x.fillStyle = look.css; x.fillRect(0, 0, gw, gh); // opaque tile: one fill paints background and grid
+        x.fillStyle = 'rgba(' + look.grid.join(',') + ',' + 0.03 * (s.grid / DEFAULTS.grid) + ')'; // default: ~4 levels over the background (lighter on a dark one, darker on a light one), like the reference
         if (s.grid > 0) { x.fillRect(0, 0, gw, 1); x.fillRect(0, 0, 1, gh); }
         grid = ctx.createPattern(t, 'repeat');
       }
@@ -954,7 +994,7 @@
     const drawCell = (a, gx, gy, code) => atlas.draw(ctx, atlas.get(code, a.lvl, variantOf(world, a, gx, gy, code)), gx, gy);
     function draw() {
       const sp = SPECIES[world.animal], cw = world.cw, ch = world.ch;
-      if (!atlas) atlas = makeAtlas(sp, gw, gh, world.levels, s.hue);
+      if (!atlas) atlas = makeAtlas(sp, gw, gh, world.levels, s.hue, look);
       ctx.setTransform(1, 0, 0, 1, 0, 0); // device pixels: every cell lands on whole pixels
       ctx.globalAlpha = 1; ctx.fillStyle = gridPattern(); ctx.fillRect(0, 0, canvas.width, canvas.height);
       if (world.trail) { // faint dotted wake: Trail sets its length, Trail fade how fast old dots fade
@@ -974,7 +1014,7 @@
         const i = atlas.get(enc(BARE, sp.P.food[0], OH), 0, 0);
         for (const p of world.pellets) atlas.draw(ctx, i, Math.floor(p.x / cw), Math.floor(p.y / ch));
       }
-      ctx.fillStyle = '#c8ccd8';
+      ctx.fillStyle = look.ripple;
       const ds = Math.max(1, Math.round(dpr * 1.3));
       for (const r of world.ripples) { // a disc of tiny grid-aligned dots that grows and fades where you clicked
         const rad = Math.min(1, r.age / 0.35) * 6, cgx = Math.floor(r.x / cw), cgy = Math.floor(r.y / ch), R = Math.ceil(rad), RX = Math.ceil((rad * ch) / cw);
@@ -1018,7 +1058,7 @@
     };
   }
 
-  const api = { ANIMALS, TWEAKS, DEFAULTS, LIMITS, LIVE, SPECIES, eff, levelsFor, normalize, fromWallpaperProps, countFor, createWorld, configure, step, poke, raster, compose, lineGlyph, hueRotate, cellColor, variantOf, start };
+  const api = { ANIMALS, TWEAKS, DEFAULTS, LIMITS, LIVE, SPECIES, eff, levelsFor, normalize, fromWallpaperProps, countFor, createWorld, configure, step, poke, raster, compose, lineGlyph, hueRotate, cellColor, variantOf, backgroundOf, lookOf, contrast, lumOf, start };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else globalThis.AsciiAnimals = api;
 })();

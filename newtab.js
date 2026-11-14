@@ -63,8 +63,18 @@
     q = String(q || '').trim().toLowerCase();
     return q ? (list || []).filter((t) => t.toLowerCase().includes(q)) : [];
   }
+  // The UI colours over the canvas for a background (AsciiAnimals.backgroundOf): the default dark-theme colours of style.css
+  // pass through look.adapt, which keeps their contrast on the new background (so they are unchanged at Background 0, and
+  // at least 4.5:1 at every tone for the text ones). The glass panel is dark on a dark background and light on a light one.
+  const UI = { fg: '#f2f3f7', strong: '#ffffff', opt: '#d6d7de', dim: '#9a9aa5', mute: '#7d7f8a', hover: '#c9cbd3', ring: '#8f939e', listen: '#ff8a8a', disc1: '#8d8c90', disc2: '#57565b' };
+  function uiVars(look) {
+    const v = { '--page': look.css, '--ink': look.light ? '0,0,0' : '255,255,255', '--shadow': look.light ? '#fff' : '#000',
+      '--panel': look.light ? 'rgba(255,255,255,0.6)' : 'rgba(11,11,17,0.6)', '--sugg': look.light ? 'rgba(255,255,255,0.88)' : 'rgba(11,11,17,0.88)' };
+    for (const k in UI) v['--' + k] = 'rgb(' + look.adapt([1, 3, 5].map((i) => parseInt(UI[k].slice(i, i + 2), 16))).join(',') + ')';
+    return v;
+  }
   if (typeof module !== 'undefined' && module.exports) { // for test.js
-    module.exports = { asUrl, greeting, addRecent, removeRecent, parseSuggest, isImageUrl, lensUrl, mergeItems, canSuggest, narrow };
+    module.exports = { uiVars, asUrl, greeting, addRecent, removeRecent, parseSuggest, isImageUrl, lensUrl, mergeItems, canSuggest, narrow };
     return;
   }
 
@@ -83,6 +93,14 @@
     st.setProperty('--glass-width', s.width + 'px');
     $('glass-map').setAttribute('scale', String(s.refraction));
     $('glass-noise').setAttribute('baseFrequency', String(s.ripple));
+  }
+
+  // Background tone: page colour, text, panel and disc colours as custom properties on <html> (no dark flash behind the canvas).
+  function applyLook(s) {
+    const look = AsciiAnimals.backgroundOf(s), v = uiVars(look), root = document.documentElement;
+    for (const k in v) root.style.setProperty(k, v[k]);
+    root.style.colorScheme = look.light ? 'light' : 'dark';
+    document.body.classList.toggle('light', look.light);
   }
 
   // ---------- search ----------
@@ -235,6 +253,7 @@
     saved = saved || {};
     setName(saved.name);
     applyGlass(AsciiAnimals.normalize(saved));
+    applyLook(saved);
     engine = AsciiAnimals.start($('bg'), saved);
   }
   if (store) {
@@ -252,6 +271,7 @@
       Object.assign(all, s);
       if ('name' in s) setName(s.name);
       applyGlass(AsciiAnimals.normalize(all));
+      applyLook(all);
       engine.update(s);
     });
   } else boot(Object.fromEntries(new URLSearchParams(location.search))); // preview: query params work here too

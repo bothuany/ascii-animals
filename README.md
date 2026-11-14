@@ -2,7 +2,27 @@
 
 Swarms of animals drawn from keyboard characters. One folder, one engine (`engine.js`), two hosts. No dependencies, and no build step to run it (packaging for the stores is under Publishing).
 
-## Chrome new tab
+## Install
+
+Download the files from the [latest release](https://github.com/bothuany/ascii-animals/releases/latest).
+
+**Chrome, Edge or Brave (new tab page)**
+
+1. Download `ascii-animals-extension.zip` and unzip it somewhere you will keep it (the browser loads it from that folder).
+2. Open `chrome://extensions` (Edge: `edge://extensions`) and turn on **Developer mode**.
+3. Click **Load unpacked** and pick the unzipped folder.
+4. Open a new tab. If the browser asks whether to keep the new tab page, choose **Keep it**.
+5. Click the extension's toolbar icon to change the animal and the look.
+
+To update, download the new zip, replace the folder's contents and press the reload button on the extension's card.
+
+**Wallpaper Engine (desktop wallpaper)**
+
+1. Download `ascii-animals-wallpaper.zip` and unzip it.
+2. In Wallpaper Engine open the **Wallpaper Editor**, choose **Create Wallpaper** and pick `wallpaper.html` from the unzipped folder.
+3. The animal and the look are in the wallpaper's properties panel.
+
+## Chrome new tab (from this folder)
 
 1. Open `chrome://extensions`, turn on **Developer mode**.
 2. **Load unpacked** and pick this folder.
@@ -16,7 +36,7 @@ Click the extension's toolbar icon: the settings open as a popup (the same page 
 - **Tweaks**, in four groups. **Reset** puts every tweak back to its default (animal and name stay); **Copy** puts the settings JSON on the clipboard.
   - *Movement*: Density (how many), Corner to corner (head along the screen diagonal; disables Direction), Direction (degrees, counter-clockwise from right: 90 = up), Speed, Sway (weaving), Spread (individual headings fan out), Size (body size), Farthest depth (size of the farthest layer), Far bias (more of them far away), Hold course (how fast they return to the heading after a scatter or a wobble), Separation (how strongly neighbours keep apart).
   - *Flight*: Flutter (erratic jitter), Glide (spells of held wings / coasting; frogs and crabs: longer pauses), Flap rate (wing beat, pulse, tail beat, hop and leg speed).
-  - *Look*: Hue shift, Shimmer (a drifting band of lighter tiles), Sparkle (single tiles flashing), Distance fade (far ones fade into the background), Trail (wake length), Trail fade (how fast the wake fades), Grid (grid line strength), ASCII detail (smaller character cells).
+  - *Look*: Hue shift, Shimmer (a drifting band of lighter tiles), Sparkle (single tiles flashing), Distance fade (far ones fade into the background), Trail (wake length), Trail fade (how fast the wake fades), Grid (grid line strength), ASCII detail (smaller character cells), Background (0 = near-black, 1 = white, in between greys; glyphs, grid and the new tab text follow it).
   - *Chat glass* (new tab search panel only): Blur, Refraction, Ripple, Tint, Edge, Corner radius, Width. Refraction and Ripple drive an SVG displacement filter in `backdrop-filter` (approximate; marked "approx." in the settings).
   One set of tweaks applies to every species; each value scales that species' own default.
 - **Clear search history** removes the recent searches.

@@ -10,7 +10,7 @@ assert.deepStrictEqual(D, A.DEFAULTS);
 assert.strictEqual(D.animal, 'butterfly');
 assert.deepStrictEqual(Object.keys(D).sort(), ['animal', 'name', ...A.TWEAKS.map((t) => t.key)].sort());
 const expect = { density: 1.05, corner: false, direction: 49, speed: 1.05, sway: 0, spread: 0, size: 1.25, farthest: 0.18, farBias: 1.7, hold: 5, separation: 700,
-  flutter: 0, glide: 2.75, flapRate: 1, hue: 0, shimmer: 0.3, sparkle: 0.12, fade: 0.75, trail: 1.55, trailFade: 0.15, grid: 1.05, detail: 1.3,
+  flutter: 0, glide: 2.75, flapRate: 1, hue: 0, shimmer: 0.3, sparkle: 0.12, fade: 0.75, trail: 1.55, trailFade: 0.15, grid: 1.05, detail: 1.3, background: 0,
   blur: 3.5, refraction: 40, ripple: 0.007, tint: 0, edge: 0.55, radius: 24, width: 720 };
 for (const k in expect) assert.strictEqual(D[k], expect[k], 'default ' + k); // the reference panel's defaults
 assert.strictEqual(A.TWEAKS.length, Object.keys(expect).length);
@@ -464,9 +464,87 @@ for (const id of ['butterfly', 'koi']) {
   for (let i = 1; i < n; i++) assert.ok(world.animals[i - 1].lvl >= world.animals[i].lvl, 'still drawn far-first');
 }
 
+// ---------- background tone ----------
+// Background: 0..1, default 0; 0 = the old near-black colour exactly, 1 = white, between = neutral greys
+assert.deepStrictEqual(A.TWEAKS.find((t) => t.key === 'background'), { key: 'background', label: 'Background', group: 'Look', min: 0, max: 1, step: 0.01, def: 0 });
+assert.strictEqual(D.background, 0);
+assert.strictEqual(A.normalize({ background: 2 }).background, 1);
+assert.strictEqual(A.normalize({ background: -3 }).background, 0);
+assert.strictEqual(A.normalize({ background: '0.5' }).background, 0.5);
+assert.strictEqual(A.normalize({ background: 0.123 }).background, 0.12);
+assert.deepStrictEqual(A.fromWallpaperProps({ background: { value: 0.4 } }), { background: 0.4 });
+assert.strictEqual(A.normalize(A.fromWallpaperProps({ background: { value: 9 } })).background, 1);
+const TONES = [0, 0.25, 0.5, 0.75, 1], bgAt = (t) => A.backgroundOf({ background: t });
+assert.deepStrictEqual(bgAt(0).rgb, [8, 9, 13]); // the former BG #08090d
+assert.deepStrictEqual(bgAt(1).rgb, [255, 255, 255]);
+assert.deepStrictEqual(A.backgroundOf({}).rgb, [8, 9, 13]);
+assert.strictEqual(A.backgroundOf({ background: '1' }).css, 'rgb(255,255,255)'); // query-string shape
+for (const t of [0.25, 0.5, 0.75]) { const c = bgAt(t).rgb; assert.ok(Math.max(...c) - Math.min(...c) <= 6 && c[0] > 8 && c[0] < 255, 'grey at ' + t); }
+assert.deepStrictEqual(TONES.map((t) => bgAt(t).light), [false, false, true, true, true]); // the flip is at luminance 0.179, where black and white contrast equally
+{
+  const hx = (c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)), mx = (c, d, t) => c.map((v, i) => Math.round(v + (d[i] - v) * t));
+  const old = (sp, code, dim, hue, variant) => { // cellColor as it was before the Background tweak
+    const kind = code >> 16, col = mx(kind === 4 ? [238, 238, 238] : A.hueRotate(hx(sp.P.cols[(code >> 8) & 255]), hue), [8, 9, 13], kind === 2 ? 0.55 + dim * 0.4 : dim);
+    return variant ? mx(col, [255, 255, 255], variant === 1 ? 0.3 : 0.8) : col;
+  };
+  const L0 = A.lookOf(0);
+  for (const id of A.ANIMALS) {
+    const sp = A.SPECIES[id];
+    for (let ci = 0; ci < sp.P.cols.length; ci++) for (const kind of [1, 2, 3, 4]) for (const dim of [0, 0.3, 0.64]) for (const hue of [0, 50]) for (const v of kind === 1 ? [0, 1, 2] : [0]) {
+      const code = (kind << 16) | (ci << 8) | 5;
+      assert.deepStrictEqual(A.cellColor(sp, code, dim, hue, v), old(sp, code, dim, hue, v), 'default look unchanged: ' + id + ' ' + ci + ' ' + kind);
+      assert.deepStrictEqual(A.cellColor(sp, code, dim, hue, v, L0), old(sp, code, dim, hue, v));
+    }
+  }
+  assert.deepStrictEqual([L0.css, L0.grid, L0.pupil, L0.lit, L0.ripple], ['rgb(8,9,13)', [140, 150, 185], [12, 12, 14], [255, 255, 255], 'rgb(200,204,216)']); // grid rgba(140,150,185,..), pupil, ripple #c8ccd8 as before
+}
+// light-on-dark parts stay readable at every tone: each bare glyph colour (antennae, tentacles, wing veins, legs, toes, dots, trail, pellets)
+// keeps min(its contrast on the default background, 2.5):1 against the actual background (3% slack for 8-bit rounding), eye tiles >= 4.5:1
+// and their pupils >= 4.5:1 on the tile, the grid lines stay between 1.01:1 and 1.12:1 (lighter on dark, darker on light)
+{
+  const BARE_KEYS = { butterfly: ['ant', 'trail'], jellyfish: ['dots', 'tent', 'streak', 'trail'], dragonfly: ['wing', 'trail'], koi: ['eye', 'dot', 'food', 'trail'],
+    frog: ['toe', 'trail'], crane: ['eye', 'beak', 'leg', 'trail'], crab: ['eye', 'leg', 'trail'] };
+  const L0 = A.lookOf(0), cr = A.contrast;
+  for (const t of TONES) {
+    const b = bgAt(t);
+    for (const id of A.ANIMALS) {
+      const sp = A.SPECIES[id];
+      for (const key of BARE_KEYS[id]) for (let ci = sp.P[key][0]; ci < sp.P[key][0] + sp.P[key][1]; ci++) {
+        const code = (3 << 16) | (ci << 8) | 5, want = Math.min(cr(A.cellColor(sp, code, 0, 0, 0, L0), L0.rgb), 2.5);
+        assert.ok(cr(A.cellColor(sp, code, 0, 0, 0, b), b.rgb) >= want * 0.97, id + ' ' + key + ' bare glyph contrast at ' + t);
+      }
+      const eye = A.cellColor(sp, (4 << 16) | 5, 0, 0, 0, b);
+      assert.ok(cr(eye, b.rgb) >= 4.5 && cr(b.pupil, eye) >= 4.5, id + ' eye tile at ' + t);
+    }
+    assert.ok(cr(b.ripple.match(/\d+/g).map(Number), b.rgb) >= 4.5, 'ripple dots at ' + t);
+    const line = b.rgb.map((v, i) => Math.round(v + (b.grid[i] - v) * 0.03)), g = cr(line, b.rgb);
+    assert.ok(g >= 1.01 && g <= 1.12 && (A.lumOf(line) > b.lum) === !b.light, 'grid contrast at ' + t + ': ' + g);
+  }
+}
+
 // ---------- newtab.js pure helpers (the file exports them instead of touching the DOM when loaded by node) ----------
 const N = require('./newtab.js');
 const { asUrl, greeting } = N;
+// new tab UI colours follow the background: unchanged at 0; text >= 4.5:1 against the background and the panel over it at every tone
+// (checked every 0.01, which includes 0, 0.25, 0.5, 0.75 and 1); the focus ring >= 3:1 against both
+{
+  const nums = (v) => v.match(/[\d.]+/g).map(Number), v0 = N.uiVars(bgAt(0));
+  assert.deepStrictEqual(v0, { '--page': 'rgb(8,9,13)', '--ink': '255,255,255', '--shadow': '#000', '--panel': 'rgba(11,11,17,0.6)', '--sugg': 'rgba(11,11,17,0.88)',
+    '--fg': 'rgb(242,243,247)', '--strong': 'rgb(255,255,255)', '--opt': 'rgb(214,215,222)', '--dim': 'rgb(154,154,165)', '--mute': 'rgb(125,127,138)', '--hover': 'rgb(201,203,211)',
+    '--ring': 'rgb(143,147,158)', '--listen': 'rgb(255,138,138)', '--disc1': 'rgb(141,140,144)', '--disc2': 'rgb(87,86,91)' });
+  const over = (p, bg) => bg.map((c, i) => Math.round(p[3] * p[i] + (1 - p[3]) * c)); // the translucent panel over the background
+  for (let i = 0; i <= 100; i++) {
+    const b = bgAt(i / 100), v = N.uiVars(b), panel = over(nums(v['--panel']), b.rgb), sugg = over(nums(v['--sugg']), b.rgb);
+    assert.strictEqual(v['--page'], b.css);
+    assert.strictEqual(nums(v['--panel'])[0], b.light ? 255 : 11, 'panel is light on a light background');
+    for (const k of ['fg', 'strong', 'opt', 'dim', 'mute', 'hover', 'listen']) {
+      const c = nums(v['--' + k]);
+      for (const [bg, what] of [[b.rgb, 'page'], [panel, 'panel'], [sugg, 'dropdown']]) assert.ok(A.contrast(c, bg) >= 4.5, k + ' on the ' + what + ' at ' + i / 100 + ': ' + A.contrast(c, bg));
+    }
+    const ring = nums(v['--ring']);
+    assert.ok(A.contrast(ring, panel) >= 3 && A.contrast(ring, b.rgb) >= 3, 'focus ring at ' + i / 100);
+  }
+}
 for (const text of ['node.js', 'index.html', 'readme.md', 'config.json', 'next.js', 'hello world', 'example.com/a b', 'javascript:alert(1)', 'merhaba']) assert.strictEqual(asUrl(text), null, text);
 assert.strictEqual(asUrl('example.com'), 'https://example.com');
 assert.strictEqual(asUrl('github.com/foo'), 'https://github.com/foo');
