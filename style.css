@@ -1,0 +1,94 @@
+:root { color-scheme: dark; }
+html, body { margin: 0; height: 100%; background: #07080c; color: #f2f3f7; font-family: Inter, system-ui, "Segoe UI", sans-serif; }
+body.newtab { overflow: hidden; }
+
+#bg { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+.defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+
+/* The overlay ignores the pointer so clicks reach the canvas (scatter/feed); only the form takes them. */
+.hero { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; padding-bottom: 16vh; box-sizing: border-box; pointer-events: none; }
+/* Grey banded disc with a concave bite out of its bottom, as in the reference. */
+.avatar {
+  width: 70px; height: 70px; border-radius: 50%; margin-bottom: 14px;
+  background: repeating-linear-gradient(-4deg, rgba(0, 0, 0, 0.16) 0 1.5px, transparent 1.5px 5px), radial-gradient(circle at 50% 25%, #8d8c90, #57565b 80%);
+  -webkit-mask: radial-gradient(circle 44px at 50% 128%, transparent 98%, #000 100%); mask: radial-gradient(circle 44px at 50% 128%, transparent 98%, #000 100%);
+}
+.hero h1 {
+  margin: 0 0 30px; padding: 0 1rem; text-align: center; font-size: 29px; line-height: 1.2; font-weight: 500; letter-spacing: -0.01em; color: #fff;
+  font-family: Inter, "SF Pro Display", -apple-system, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; text-shadow: 0 2px 14px #000;
+}
+/* The search panel ("chat glass"): Blur, Tint, Edge, Corner radius and Width come from the settings as variables;
+   Refraction and Ripple drive the #glass SVG filter (Chromium applies url() filters in backdrop-filter). */
+.hero form {
+  --glass-blur: 3.5px; --glass-tint: 0; --glass-edge: 0.55; --glass-radius: 24px; --glass-width: 720px;
+  position: relative; pointer-events: auto; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;
+  width: min(var(--glass-width), 92vw); min-height: 106px; padding: 18px 14px 12px 20px; border-radius: var(--glass-radius);
+  background: linear-gradient(rgba(255, 255, 255, calc(var(--glass-tint) * 0.16)), rgba(255, 255, 255, calc(var(--glass-tint) * 0.16))), rgba(11, 11, 17, 0.6);
+  border: 1px solid rgba(255, 255, 255, calc(var(--glass-edge) * 0.14));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, calc(var(--glass-edge) * 0.12)), 0 10px 40px rgba(0, 0, 0, 0.35);
+  -webkit-backdrop-filter: blur(var(--glass-blur)); backdrop-filter: blur(var(--glass-blur));
+  backdrop-filter: url(#glass) blur(var(--glass-blur)); color: #a3a3ad;
+}
+/* Focus: a 2 px neutral grey ring (border + 1 px shadow, no layout shift). #8f939e is 6.4:1 against the panel
+   fill and 5.5:1 against the unfocused border over the dark page (WCAG 1.4.11 needs 3:1). */
+.hero form:focus-within { border-color: #8f939e; box-shadow: 0 0 0 1px #8f939e, 0 10px 40px rgba(0, 0, 0, 0.35); }
+.hero .row { display: flex; align-items: center; gap: 11px; }
+.hero .mag { flex: none; }
+.hero input { flex: 1; min-width: 0; padding: 0; font: inherit; font-size: 16px; color: #f2f3f7; background: transparent; border: 0; outline: 0; }
+.hero input::placeholder { color: #9a9aa5; }
+.hero .tools { justify-content: flex-end; gap: 4px; min-height: 32px; }
+.hero .msg { flex: 1; font-size: 13px; color: #9a9aa5; }
+.hero .tool {
+  display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: #7d7f8a; cursor: pointer;
+}
+.hero .tool:hover { color: #c9cbd3; background: rgba(255, 255, 255, 0.06); }
+.hero .tool:focus-visible { outline: 2px solid #8f939e; outline-offset: 1px; }
+.hero .tool.listening { color: #ff8a8a; background: rgba(255, 90, 90, 0.14); }
+/* Suggestions / recent searches: under the panel, same dark glass, above the canvas. */
+.hero .sugg {
+  position: absolute; z-index: 2; top: calc(100% + 8px); left: 0; right: 0; margin: 0; padding: 6px; list-style: none;
+  max-height: min(340px, 45vh); overflow-y: auto; border-radius: 16px; box-sizing: border-box;
+  background: rgba(11, 11, 17, 0.88); border: 1px solid rgba(255, 255, 255, 0.09); box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+}
+.hero .sugg[hidden] { display: none; }
+.hero .opt { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 6px 0 10px; border-radius: 10px; color: #d6d7de; font-size: 15px; cursor: pointer; }
+.hero .opt .ico { display: grid; color: #7d7f8a; }
+.hero .opt .txt { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.hero .opt:hover, .hero .opt[aria-selected="true"] { background: rgba(255, 255, 255, 0.08); color: #fff; }
+.hero .opt[aria-selected="true"] { box-shadow: inset 2px 0 0 #8f939e; }
+.hero .rm { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: #7d7f8a; cursor: pointer; }
+.hero .rm:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
+
+/* options page */
+/* Settings: the toolbar popup (340 px wide, at most 560 px tall, scrolls) and the embedded options page share this layout. */
+html:has(body.opts) { height: auto; overflow: hidden; background: #08090d; }
+body.opts {
+  box-sizing: border-box; width: 340px; max-width: 100%; height: auto; max-height: 560px; margin: 0; padding: 16px; display: grid; gap: 14px;
+  overflow-x: hidden; overflow-y: auto; background: #08090d; font-size: 14px; font-family: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+.opts h1 { margin: 0; font-size: 16px; font-weight: 600; }
+.opts form { display: grid; gap: 12px; min-width: 0; }
+.opts label { display: grid; gap: 6px; color: #c9cbd3; }
+.opts #tweaks { display: grid; gap: 12px; }
+.opts fieldset { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 10px 12px 12px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; }
+.opts legend { padding: 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
+.opts .tw { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px; }
+.opts .tw label { display: block; font-size: 13px; }
+.opts .tw input[type="range"] { grid-column: 1 / -1; }
+.opts .tw.check { display: flex; gap: 8px; }
+.opts output { color: #fff; font-size: 13px; font-variant-numeric: tabular-nums; }
+.opts input[type="range"] { width: 100%; margin: 0; accent-color: #8f939e; }
+.opts input[type="range"]:disabled { opacity: 0.4; }
+.opts input[type="checkbox"] { margin: 0; accent-color: #8f939e; }
+.opts input[type="text"], .opts select, .opts button {
+  box-sizing: border-box; width: 100%; padding: 8px 10px; font: inherit; color: #f2f3f7;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px;
+}
+.opts select option { background: #14151b; }
+.opts .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.opts button { cursor: pointer; color: #c9cbd3; }
+.opts button:hover { background: rgba(255, 255, 255, 0.09); }
+.opts :is(input, select, button):focus-visible { outline: 2px solid #8f939e; outline-offset: 2px; }
+#status { min-height: 1.2em; color: #8fe0a8; }

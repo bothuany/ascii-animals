@@ -1,0 +1,1 @@
+{"name":"ascii-animals-tools","private":true,"description":"Asset generation tooling (not shipped)","dependencies":{"puppeteer-core":"^25.17.0"}}

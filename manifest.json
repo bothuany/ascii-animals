@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "ASCII Animals",
+  "version": "1.0.0",
+  "description": "Turn your new tab into a living canvas of animals drawn from keyboard characters, with a built-in search box.",
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "chrome_url_overrides": { "newtab": "newtab.html" },
+  "options_ui": { "page": "options.html", "open_in_tab": false },
+  "action": {
+    "default_popup": "options.html",
+    "default_title": "ASCII Animals settings",
+    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "permissions": ["storage", "search"],
+  "host_permissions": ["https://suggestqueries.google.com/*"]
+}

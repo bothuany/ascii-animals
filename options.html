@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Animals Settings</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="opts">
+<h1>ASCII Animals</h1>
+<form id="f">
+  <label>Animal
+    <select id="animal">
+      <option value="butterfly">Butterfly</option>
+      <option value="jellyfish">Jellyfish</option>
+      <option value="dragonfly">Dragonfly</option>
+      <option value="koi">Koi</option>
+      <option value="frog">Frog</option>
+      <option value="crane">Crane</option>
+      <option value="crab">Crab</option>
+    </select>
+  </label>
+  <label>Name (for the greeting)
+    <input id="name" type="text" maxlength="40" autocomplete="off">
+  </label>
+  <!-- options.js adds the Movement, Flight, Look and Chat glass groups here, from the engine's tweak list -->
+  <div id="tweaks"></div>
+</form>
+<div class="btns">
+  <button id="reset" type="button">Reset</button>
+  <button id="copy" type="button">Copy</button>
+</div>
+<button id="clear-history" type="button">Clear search history</button>
+<div id="status" role="status"></div>
+<script src="engine.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

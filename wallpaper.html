@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Animals</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0b10; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<script src="engine.js"></script>
+<script>
+  // Settings: defaults < ?query overrides (for previewing without a host) < Wallpaper Engine properties.
+  // The listener is assigned synchronously so no early property event is missed; properties may
+  // arrive before start() (merged into `pending`) or after it (forwarded to engine.update).
+  (function () {
+    var pending = Object.fromEntries(new URLSearchParams(location.search));
+    var engine = null, fps = 0;
+    window.wallpaperPropertyListener = {
+      applyUserProperties: function (props) {
+        var s = AsciiAnimals.fromWallpaperProps(props);
+        if (engine) engine.update(s); else Object.assign(pending, s);
+      },
+      // The user's FPS limit from the Wallpaper Engine performance settings (a number, e.g. 30).
+      applyGeneralProperties: function (props) {
+        if (props && props.fps) { fps = props.fps; if (engine) engine.setFps(fps); }
+      }
+    };
+    engine = AsciiAnimals.start(document.getElementById('bg'), pending);
+    engine.setFps(fps);
+  })();
+</script>
+</body>
+</html>
