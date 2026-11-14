@@ -16,6 +16,8 @@ Download the files from the [latest release](https://github.com/bothuany/ascii-a
 
 To update, download the new zip, replace the folder's contents and press the reload button on the extension's card.
 
+Chrome adds a footer bar with the extension's name to any new tab page an extension replaces. The extension cannot remove it, but you can: click **Customize Chrome** in that bar, find **Footer** in the side panel and turn off showing the footer on the New Tab page.
+
 **Wallpaper Engine (desktop wallpaper)**
 
 1. Download `ascii-animals-wallpaper.zip` and unzip it.
