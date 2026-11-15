@@ -3,28 +3,21 @@
   const A = AsciiAnimals;
   const $ = (id) => document.getElementById(id);
   const sync = typeof chrome !== 'undefined' && chrome.storage && chrome.storage.sync ? chrome.storage.sync : null;
-  // Shown next to a label where the effect is not the reference's exactly (see README).
+  // Shown next to a label where the effect is not the original's exactly (see README).
   const NOTES = { refraction: 'approx.', ripple: 'approx.' };
   const decimals = (t) => (String(t.step).split('.')[1] || '').length;
   const fmt = (t, v) => Number(v).toFixed(decimals(t));
+  const KEYS = ['animal', 'name', 'background', 'tuning', 'glass']; // what is stored; any other key in storage is from an older version
 
-  // One group per heading, one control per tweak; each <label for> is bound to its input.
-  let group = null;
-  for (const t of A.TWEAKS) {
-    if (!group || group.dataset.name !== t.group) {
-      group = document.createElement('fieldset');
-      group.dataset.name = t.group;
-      const h = document.createElement('legend');
-      h.textContent = t.group + (t.group === 'Chat glass' ? ' (new tab search panel)' : '');
-      group.append(h);
-      $('tweaks').append(group);
-    }
+  // One labelled control per tweak; each <label for> is bound to its input.
+  function control(t, prefix) {
     const row = document.createElement('div'), label = document.createElement('label'), input = document.createElement('input');
-    row.className = 'tw' + (typeof t.def === 'boolean' ? ' check' : '');
-    input.id = 't-' + t.key;
+    row.className = 'tw' + (t.type === 'toggle' ? ' check' : '');
+    if (t.hint) row.title = t.hint;
+    input.id = prefix + t.key;
     label.htmlFor = input.id;
     label.textContent = t.label + (NOTES[t.key] ? ' (' + NOTES[t.key] + ')' : '');
-    if (typeof t.def === 'boolean') {
+    if (t.type === 'toggle') {
       input.type = 'checkbox';
       row.append(input, label);
     } else {
@@ -34,23 +27,59 @@
       input.addEventListener('input', () => { out.textContent = fmt(t, input.value); });
       row.append(label, out, input);
     }
-    group.append(row);
+    return row;
+  }
+  // Fieldsets by group heading, in the given order.
+  function groups(host, list, prefix, legend) {
+    let group = null;
+    for (const t of list) {
+      if (!group || group.dataset.name !== t.group) {
+        group = document.createElement('fieldset');
+        group.dataset.name = t.group;
+        const h = document.createElement('legend');
+        h.textContent = legend ? legend(t.group) : t.group;
+        group.append(h);
+        host.append(group);
+      }
+      group.append(control(t, prefix));
+    }
   }
 
+  // The animal's own tweaks (Movement, its groups, Look) are rebuilt when the animal changes; Background and Chat glass are the same for all.
+  let shown = null; // the animal whose tweaks are on screen
+  function build(animal) {
+    shown = animal;
+    $('tweaks').textContent = '';
+    groups($('tweaks'), A.TWEAKS[animal], 't-');
+  }
+  groups($('extras'), [A.BACKGROUND], 't-', () => 'Background');
+  groups($('extras'), A.GLASS, 'g-', (g) => g + ' (new tab search panel)');
+  for (const id of A.ANIMALS) $('animal').append(new Option(A.LABELS[id], id));
+
+  const setValue = (t, el, v) => {
+    if (t.type === 'toggle') el.checked = v;
+    else { el.value = v; $(el.id + '-out').textContent = fmt(t, v); }
+  };
+  const getValue = (t, el) => (t.type === 'toggle' ? el.checked : el.value);
+  const updateDisabled = () => { // e.g. Corner to corner sets the direction itself
+    for (const t of A.TWEAKS[shown]) if (t.disabledWhen) $('t-' + t.key).disabled = $('t-' + t.disabledWhen).checked;
+  };
   function fill(s) {
     $('animal').value = s.animal;
     $('name').value = s.name;
-    for (const t of A.TWEAKS) {
-      const el = $('t-' + t.key);
-      if (typeof t.def === 'boolean') el.checked = s[t.key];
-      else { el.value = s[t.key]; $('t-' + t.key + '-out').textContent = fmt(t, s[t.key]); }
-    }
-    $('t-direction').disabled = s.corner; // Corner to corner sets the direction itself
+    if (shown !== s.animal) build(s.animal);
+    const own = s.tuning[s.animal] || {};
+    for (const t of A.TWEAKS[shown]) setValue(t, $('t-' + t.key), t.key in own ? own[t.key] : t.def);
+    setValue(A.BACKGROUND, $('t-background'), s.background);
+    for (const t of A.GLASS) setValue(t, $('g-' + t.key), s.glass[t.key]);
+    updateDisabled();
   }
-  function read() {
-    const r = { animal: $('animal').value, name: $('name').value };
-    for (const t of A.TWEAKS) { const el = $('t-' + t.key); r[t.key] = typeof t.def === 'boolean' ? el.checked : el.value; }
-    return A.normalize(r);
+  let cur = A.normalize(); // the settings as last read or loaded: the other animals' tweaks are kept in it
+  function read() { // the form as settings
+    const own = {}, glass = {};
+    for (const t of A.TWEAKS[shown]) own[t.key] = getValue(t, $('t-' + t.key));
+    for (const t of A.GLASS) glass[t.key] = $('g-' + t.key).value;
+    return A.normalize({ animal: $('animal').value, name: $('name').value, background: $('t-background').value, tuning: Object.assign({}, cur.tuning, { [shown]: own }), glass });
   }
 
   const say = (text) => { $('status').textContent = text; };
@@ -61,8 +90,8 @@
   function save(isRetry) {
     clearTimeout(timer); timer = 0;
     clearTimeout(retry); retry = 0;
-    const s = read();
-    $('t-direction').disabled = s.corner;
+    const s = cur = read();
+    updateDisabled();
     if (!sync) { say('Not running as an extension: nothing saved.'); return; }
     sync.set(s, () => {
       if (chrome.runtime.lastError) {
@@ -70,7 +99,7 @@
         if (isRetry !== true) retry = setTimeout(() => save(true), 2000);
         return;
       }
-      if (legacy.length) { sync.remove(legacy); legacy = []; } // keys of older versions, replaced by Density (size and trail keep their names with new meanings)
+      if (legacy.length) { sync.remove(legacy); legacy = []; } // the flat keys of older versions, replaced by the per-animal tweaks
       say('Saved.');
     });
   }
@@ -79,6 +108,8 @@
   // Sliders and the name box: every input and change event goes through the same debounce (a toolbar popup is destroyed
   // as soon as it loses focus, which is what the flush below is for).
   const onEdit = (e) => { if (!immediate(e.target)) later(); else if (e.type === 'change') save(); };
+  // The animal's own handler runs before the form's: the old animal's tweaks are read into `cur`, then the new animal's are shown.
+  $('animal').addEventListener('change', () => { cur = read(); fill(cur); });
   $('f').addEventListener('input', onEdit);
   $('f').addEventListener('change', onEdit);
   const flush = () => { if (timer || retry) save(); };
@@ -86,10 +117,12 @@
   document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
   $('f').addEventListener('submit', (e) => e.preventDefault());
 
-  // Reset puts every tweak back to its default; the animal and name stay.
+  // Reset puts the selected animal's tweaks, the background and the glass back to their defaults; the animal, the name and the
+  // other animals' tweaks stay.
   $('reset').addEventListener('click', () => {
-    const cur = read();
-    fill(A.normalize({ animal: cur.animal, name: cur.name }));
+    const s = read(), tuning = Object.assign({}, s.tuning);
+    delete tuning[s.animal];
+    fill(cur = A.normalize({ animal: s.animal, name: s.name, tuning }));
     save();
   });
   $('copy').addEventListener('click', () => {
@@ -105,6 +138,6 @@
     local.remove('recents', () => { say(chrome.runtime.lastError ? 'Could not clear: ' + chrome.runtime.lastError.message : 'Search history cleared.'); });
   });
 
-  if (sync) sync.get(null, (saved) => { legacy = ['count'].filter((k) => saved && k in saved); fill(A.normalize(saved)); });
-  else fill(A.normalize(Object.fromEntries(new URLSearchParams(location.search))));
+  if (sync) sync.get(null, (saved) => { saved = saved || {}; legacy = Object.keys(saved).filter((k) => !KEYS.includes(k)); fill(cur = A.normalize(saved)); });
+  else fill(cur = A.fromQuery(location.search)); // preview: ?animal=koi&background=0.5&speed=1.4
 })();

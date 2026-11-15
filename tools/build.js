@@ -9,8 +9,9 @@ const dist = path.join(root, 'dist');
 const fail = (msg) => { console.error('BUILD FAILED: ' + msg); process.exit(1); };
 
 // Whitelists: only these files ship. Icons are every PNG in icons/.
-const EXT = ['manifest.json', 'newtab.html', 'newtab.js', 'options.html', 'options.js', 'style.css', 'engine.js'];
-const WALL = ['wallpaper.html', 'engine.js', 'project.json', 'preview.gif'];
+const LICENCE = ['fonts/OFL.txt', 'THIRD_PARTY.md']; // the fonts' licence ships with them
+const EXT = ['manifest.json', 'newtab.html', 'newtab.js', 'options.html', 'options.js', 'style.css', 'engine.js', 'fonts/Geist-Regular.ttf', 'fonts/Geist-Medium.ttf', 'fonts/GeistMono-SemiBold.ttf', ...LICENCE];
+const WALL = ['wallpaper.html', 'engine.js', 'project.json', 'preview.gif', 'fonts/GeistMono-SemiBold.ttf', ...LICENCE]; // the wallpaper has no text, only the animals' font
 const ICONS = ['icons/icon16.png', 'icons/icon48.png', 'icons/icon128.png'];
 const LEAK = /(^|\/)(test\.js|demo|tools|node_modules|store|dist)(\/|$)|readme|privacy/i;
 

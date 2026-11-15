@@ -84,7 +84,7 @@
   const setName = (n) => { name = AsciiAnimals.normalize({ name: n }).name; render(); };
 
   // ---------- chat glass (the search panel) ----------
-  function applyGlass(s) {
+  function applyGlass(s) { // s = the settings' glass object (all seven values)
     const st = $('search').style;
     st.setProperty('--glass-blur', s.blur + 'px');
     st.setProperty('--glass-tint', String(Math.min(1, s.tint / 3)));
@@ -252,7 +252,7 @@
   function boot(saved) {
     saved = saved || {};
     setName(saved.name);
-    applyGlass(AsciiAnimals.normalize(saved));
+    applyGlass(AsciiAnimals.normalize(saved).glass);
     applyLook(saved);
     engine = AsciiAnimals.start($('bg'), saved);
   }
@@ -270,11 +270,11 @@
       for (const k in changes) s[k] = changes[k].newValue;
       Object.assign(all, s);
       if ('name' in s) setName(s.name);
-      applyGlass(AsciiAnimals.normalize(all));
+      applyGlass(AsciiAnimals.normalize(all).glass);
       applyLook(all);
       engine.update(s);
     });
-  } else boot(Object.fromEntries(new URLSearchParams(location.search))); // preview: query params work here too
+  } else boot(AsciiAnimals.fromQuery(location.search)); // preview: ?animal=koi&background=0.5&speed=1.4 works here too
   setInterval(render, 60000); // keep the greeting current on a tab left open
   input.focus(); // Chrome may still give the omnibox focus first on a new tab; that is browser behaviour.
 })();

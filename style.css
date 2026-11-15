@@ -1,8 +1,13 @@
+/* Geist (Regular, Medium) and Geist Mono (SemiBold, the animal glyphs): local files, SIL OFL 1.1 (fonts/OFL.txt). */
+@font-face { font-family: 'Geist'; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/Geist-Regular.ttf) format('truetype'); }
+@font-face { font-family: 'Geist'; font-style: normal; font-weight: 500; font-display: swap; src: url(fonts/Geist-Medium.ttf) format('truetype'); }
+@font-face { font-family: 'Geist Mono'; font-style: normal; font-weight: 600; font-display: swap; src: url(fonts/GeistMono-SemiBold.ttf) format('truetype'); }
+
 :root { color-scheme: dark; }
-html, body { margin: 0; height: 100%; background: var(--page, #07080c); color: var(--fg, #f2f3f7); font-family: Inter, system-ui, "Segoe UI", sans-serif; }
+html, body { margin: 0; height: 100%; background: var(--page, #06070c); color: var(--fg, #f2f3f7); font-family: Geist, ui-sans-serif, system-ui, sans-serif; }
 body.newtab { overflow: hidden; }
 
-#bg { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+#bg { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; font-family: "Geist Mono", ui-monospace, Menlo, monospace; } /* the engine draws its glyphs in this font */
 .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
 
 /* The overlay ignores the pointer so clicks reach the canvas (scatter/feed); only the form takes them. */
@@ -15,7 +20,7 @@ body.newtab { overflow: hidden; }
 }
 .hero h1 {
   margin: 0 0 30px; padding: 0 1rem; text-align: center; font-size: 29px; line-height: 1.2; font-weight: 500; letter-spacing: -0.01em; color: var(--strong, #fff);
-  font-family: Inter, "SF Pro Display", -apple-system, "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; text-shadow: 0 2px 14px var(--shadow, #000);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", Geist, system-ui, sans-serif; text-shadow: 0 2px 14px var(--shadow, #000);
 }
 /* The search panel ("chat glass"): Blur, Tint, Edge, Corner radius and Width come from the settings as variables;
    Refraction and Ripple drive the #glass SVG filter (Chromium applies url() filters in backdrop-filter). */
@@ -71,7 +76,7 @@ body.opts {
 .opts h1 { margin: 0; font-size: 16px; font-weight: 600; }
 .opts form { display: grid; gap: 12px; min-width: 0; }
 .opts label { display: grid; gap: 6px; color: #c9cbd3; }
-.opts #tweaks { display: grid; gap: 12px; }
+.opts :is(#tweaks, #extras) { display: grid; gap: 12px; }
 .opts fieldset { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 10px 12px 12px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; }
 .opts legend { padding: 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
 .opts .tw { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px; }

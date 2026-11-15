@@ -2,7 +2,7 @@
 
 ![ASCII Animals as a new tab page: koi, butterflies and jellyfish drawn from keyboard characters drift behind a search box](store/preview-browser.gif)
 
-Swarms of animals drawn from keyboard characters. One folder, one engine (`engine.js`), two hosts. No dependencies, and no build step to run it (packaging for the stores is under Publishing).
+Swarms of animals drawn from keyboard characters. One folder, one engine (`engine.js`), two hosts. No dependencies, and no build step to run it (packaging for the stores is under Publishing). How it is put together is under How it works.
 
 ## Install
 
@@ -36,16 +36,13 @@ Chrome adds a footer bar with the extension's name to any new tab page an extens
 
 Click the extension's toolbar icon: the settings open as a popup (the same page is also under **Details -> Extension options**). Changes are saved to `chrome.storage.sync` at once (slider drags after a short pause) and open new tabs update live. There are no controls on the new tab itself.
 
-- **Animal** (never random) and **Name** for the greeting.
-- **Tweaks**, in four groups. **Reset** puts every tweak back to its default (animal and name stay); **Copy** puts the settings JSON on the clipboard.
-  - *Movement*: Density (how many), Corner to corner (head along the screen diagonal; disables Direction), Direction (degrees, counter-clockwise from right: 90 = up), Speed, Sway (weaving), Spread (individual headings fan out), Size (body size), Farthest depth (size of the farthest layer), Far bias (more of them far away), Hold course (how fast they return to the heading after a scatter or a wobble), Separation (how strongly neighbours keep apart).
-  - *Flight*: Flutter (erratic jitter), Glide (spells of held wings / coasting; frogs and crabs: longer pauses), Flap rate (wing beat, pulse, tail beat, hop and leg speed).
-  - *Look*: Hue shift, Shimmer (a drifting band of lighter tiles), Sparkle (single tiles flashing), Distance fade (far ones fade into the background), Trail (wake length), Trail fade (how fast the wake fades), Grid (grid line strength), ASCII detail (smaller character cells), Background (0 = near-black, 1 = white, in between greys; glyphs, grid and the new tab text follow it).
-  - *Chat glass* (new tab search panel only): Blur, Refraction, Ripple, Tint, Edge, Corner radius, Width. Refraction and Ripple drive an SVG displacement filter in `backdrop-filter` (approximate; marked "approx." in the settings).
-  One set of tweaks applies to every species; each value scales that species' own default.
-- **Clear search history** removes the recent searches.
+- **Animal** (Butterfly, Koi, Jellyfish, Dragonfly, Frog, Crane, Crab; never random) and **Name** for the greeting.
+- **The animal's tweaks**, grouped as in the original's panel and rebuilt when you pick another animal. Each animal has its own values and remembers them while you look at another one. Movement (Density, Corner to corner, Direction, Speed, Sway, Spread, Size, Farthest depth, Far bias, Hold course, Separation), then the animal's own group (Flight: butterflies, dragonflies and cranes; Swimming and Feeding: koi; Swimming: jellyfish; Leaping: frogs; Scuttling: crabs), then Look (Hue shift, Shimmer, Sparkle, Distance fade, Trail, Trail fade, Grid, ASCII detail). A few shared tweaks are not shown for an animal that does not use them (Hold course for frogs, Shimmer for jellyfish and dragonflies). Hover a control for the original's explanation. The defaults are the original's, per animal, so every animal looks as it does in the original at its defaults.
+- **Background**: 0 = the original's dark background, 1 = white, greys in between. The animals' colours, the grid and the new tab text follow it (see How it works).
+- **Chat glass** (new tab search panel only; the same for every animal): Blur, Refraction, Ripple, Tint, Edge, Corner radius, Width. Refraction and Ripple drive an SVG displacement filter in `backdrop-filter` (approximate; marked "approx." in the settings).
+- **Reset** puts the selected animal's tweaks, the background and the glass back to their defaults (animal, name and the other animals' tweaks stay). **Copy** puts the settings JSON on the clipboard. **Clear search history** removes the recent searches.
 
-Settings saved by older versions (`count`, a 6-20 character `size`, `trail` on/off, `random` animal) are mapped to the new ones.
+Settings saved by older versions (flat relative tweaks such as `density` or `hue`, `count`, a character `size`, `trail` on/off, singular animal ids, `random`) are migrated: the animal, name, background and glass values are kept, the old relative animal tweaks are dropped (they do not map onto the per-animal values).
 
 ### Search box
 
@@ -60,19 +57,24 @@ Permissions: `storage` (settings and recents), `search` (default search engine),
 ## Wallpaper Engine
 
 1. In the Wallpaper Editor choose **Create Wallpaper** and drop `wallpaper.html` onto it (or pick it with the file dialog). Wallpaper Engine **copies** the folder into `...\projects\myprojects\`. After editing `engine.js` here, re-import (or copy the file into that folder).
-2. Select the wallpaper in the **Installed** tab. Settings are on the right: animal plus the Movement, Flight and Look tweaks (defined in `project.json`, keys are the tweak names in lowercase, e.g. `farbias`). The FPS limit from Wallpaper Engine's performance settings is respected.
+2. Select the wallpaper in the **Installed** tab. The properties (defined in `project.json`) are a shorter set than the extension's settings: the full per-animal tweak panel is in the browser extension. The wallpaper has **Animal**, **Background**, and these, which act on the selected animal and are relative to its original defaults (1 = the original look): **Density**, **Speed**, **Size**, **Trail**, **Grid** and **ASCII detail** are multipliers (the result is clamped to the original's range; an animal whose default is 0, like the crane's trail, stays at 0), and **Hue shift** is in degrees. Wallpaper Engine's FPS limit is respected.
+
+## How it works
+
+`engine.js` is the original app's animation engine, carried over unchanged, plus a thin wrapper (about 210 lines at the end of the file). The engine is one generic flock simulation and renderer with a definition object per animal (shape, motion, colours, and the list of tweaks it has); the wrapper adds the settings, the background tone and `start()`. Lines marked `patch` inside the carried-over code are the only changes: an FPS limit, pausing while the page is hidden, the palette hook for the background tone (with a colour cap on light backgrounds), and guards for browsers that lack `ResizeObserver`, `IntersectionObserver` or `matchMedia`.
+
+- **Settings** are `{ animal, name, background, tuning, glass }`. `tuning` is `{ <animal>: { <key>: value } }` and holds only the values that differ from that animal's defaults. `AsciiAnimals.normalize()` clamps and snaps everything, drops unknown keys and migrates older settings. The tweak list of each animal (`AsciiAnimals.TWEAKS`) is read from the carried-over definitions, so the settings page, the tests and the engine cannot disagree.
+- **Background tone**: the background is the original dark one mixed toward white. At 0 the renderer gets the original dark palette untouched. Above 0 it gets the original light or dark palette, whichever has more contrast for its ink against the actual background, with the background colour replaced. On the light palette any colour brighter than a cap (about 2.5:1 against the background, `CAP_CONTRAST` in `engine.js`) is darkened, keeping its hue, and glyphs that the original brightens over their tile are darkened instead.
+- **Fonts**: Geist and Geist Mono (SIL OFL 1.1) are bundled in `fonts/` and declared with local `@font-face` rules; nothing is loaded from the network. The animals are drawn in Geist Mono SemiBold (the canvas's CSS `font-family`), the new tab text is Geist. See `THIRD_PARTY.md` and `fonts/OFL.txt`.
+- **Hosts**: `newtab.html` + `newtab.js` (the greeting, the search box, the glass panel) and `wallpaper.html` only create a canvas and call `AsciiAnimals.start(canvas, settings)`, which returns `{ update(settings), setFps(n), destroy() }`. Clicking the scene startles the animals (the new tab overlay lets clicks through to the canvas). With `prefers-reduced-motion` the scene is one still frame.
 
 ## Preview without a host
 
-Both hosts draw the same background: a faint grid of character-shaped cells, animals built from glyph tiles that travel together along one heading (small, dim ones further back), spaced apart; where two overlap, the nearer one is drawn whole with a one-cell gap around it. A click turns nearby animals away before they rejoin the flock; koi get food instead and bend toward it.
+Open `wallpaper.html`, `newtab.html` or `options.html` from a local static server, with optional overrides. Here a tweak key is an absolute value for the chosen animal:
 
-The whole scene scales with the window width: the grid is 160 cells wide at the default ASCII detail (so a cell is about 5 x 7 px in a 760 px window, 9 x 13 at 1440, 12 x 17 at 1920), animals keep their size in cells, and the number of animals does not depend on the window. Density multiplies the count; a Size above the default divides it by Size squared (bigger bodies, fewer of them), which also keeps the drawing cost bounded.
+    wallpaper.html?animal=koi&background=0.5&speed=1.4&trail=2
 
-Open `wallpaper.html` (or `newtab.html`) from a local static server, with optional overrides using the tweak names:
-
-    wallpaper.html?animal=koi&density=2&speed=1.5&size=1.6&direction=90&trail=0&hue=40
-
-`animal` is one of `butterfly jellyfish dragonfly koi frog crane crab` (default `butterfly`; `bird` is accepted as an old name for `crane`). Values are clamped to the slider ranges. Without the extension, `newtab.html` searches go to google.com, recents are kept in memory only, and suggestions are blocked by CORS (they work inside the extension).
+`animal` is one of `butterflies koi jellyfish dragonflies frogs cranes crabs` (default `butterflies`; the singular names of earlier versions, such as `butterfly` or `bird`, are accepted). Values are clamped to the slider ranges; keys the animal does not have are ignored; glass keys (`blur`, `width`, ...) and `name` work on the new tab page. Without the extension, `newtab.html` searches go to google.com, recents are kept in memory only, and suggestions are blocked by CORS (they work inside the extension).
 
 ## Publishing
 

@@ -1,525 +1,393 @@
-// Self-check for the pure logic in engine.js and newtab.js: node test.js
+// Self-check: node test.js
+// engine.js (the settings schema, normalize, the Wallpaper Engine mapping, the background tone, the animation engine run without a
+// browser) and the pure helpers of newtab.js.
 const assert = require('assert');
 const fs = require('fs');
 const A = require('./engine.js');
+const I = A.internals;
 
-// ---------- settings ----------
-// normalize: defaults, clamping, step snapping, and the odd shapes hosts send (WE values, query strings, storage junk)
+// ---------- schema ----------
+// The seven animals in the original's order, with their labels.
+assert.deepStrictEqual(A.ANIMALS, ['butterflies', 'koi', 'jellyfish', 'dragonflies', 'frogs', 'cranes', 'crabs']);
+assert.deepStrictEqual(A.ANIMALS.map((id) => A.LABELS[id]), ['Butterfly', 'Koi', 'Jellyfish', 'Dragonfly', 'Frog', 'Crane', 'Crab']);
+// Shared tweaks: the default of each animal (null = the original hides that tweak for the animal).
+const SHARED = {
+  //           butterflies koi   jellyfish dragonflies frogs  cranes crabs
+  density:    [1.05, 1.6, 1, 2.1, 1.3, 0.8, 1.8],
+  corner:     [false, false, false, false, false, false, false],
+  direction:  [49, 49, 49, 49, 49, 49, 49],
+  speed:      [1.05, 1.6, 1.05, 1, 1, 1.5, 1],
+  sway:       [0, 0, 0.04, 0, 0, 0, 0],
+  spread:     [0, 0, 0.08, 0, 0, 0, 0],
+  size:       [1.25, 1, 1, 1, 1.2, 1, 1],
+  farthest:   [0.18, 0.33, 0.3, 0.32, 0.35, 0.35, 0.25],
+  farBias:    [1.7, 1.3, 1.4, 3, 1.4, 1.3, 0.7],
+  grip:       [5, 2.65, 1.4, 5, null, 3, 3],
+  separation: [700, 780, 300, 720, 450, 150, 400],
+  hueShift:   [0, 0, 0, 0, 0, 0, 0],
+  shimmer:    [0.3, 0.35, null, null, 0.15, 0.1, 0.1],
+  sparkle:    [0.12, 0.08, 0.1, 0.18, 0.05, 0.04, 0.03],
+  fog:        [0.75, 0.64, 0.75, 0.26, 0, 0.75, 0.12],
+  trail:      [1.55, 4, 0.8, 0.6, 3.45, 0, 1.2],
+  trailFade:  [0.15, 0.4, 0.6, 1.2, 0.4, 1.3, 0.35],
+  grid:       [1.05, 1.05, 1.05, 1.05, 1.05, 1.05, 1.05],
+  detail:     [1.3, 1.3, 1.3, 1.3, 1.3, 1.7, 1.7],
+};
+const RANGE = { density: [0.1, 4, 0.05], direction: [0, 360, 1], speed: [0.1, 3, 0.05], sway: [0, 0.6, 0.01], spread: [0, 0.8, 0.01], size: [0.3, 2.5, 0.05],
+  farthest: [0.1, 1, 0.01], farBias: [0.3, 3, 0.05], grip: [0.2, 5, 0.05], separation: [0, 1000, 10], hueShift: [-180, 180, 1], shimmer: [0, 1, 0.01],
+  sparkle: [0, 0.5, 0.01], fog: [0, 1, 0.01], trail: [0, 4, 0.05], trailFade: [0.05, 6, 0.05], grid: [0, 4, 0.05], detail: [0.5, 2, 0.05] };
+// The animals' own groups: [animal, group, key, label, min, max, step, default].
+const OWN = [
+  ['butterflies', 'Flight', 'flutter', 'Flutter', 0, 3, 0.05, 0], ['butterflies', 'Flight', 'glide', 'Glide', 0, 4, 0.05, 2.75], ['butterflies', 'Flight', 'flapRate', 'Flap rate', 0.2, 3, 0.05, 1],
+  ['koi', 'Swimming', 'meander', 'Meander', 0, 3, 0.05, 0.4], ['koi', 'Swimming', 'tailBeat', 'Tail beat', 0.2, 3, 0.05, 1], ['koi', 'Feeding', 'foodRange', 'Food range', 0, 500, 10, 200],
+  ['jellyfish', 'Swimming', 'pulseRate', 'Pulse rate', 0.2, 3, 0.05, 1], ['jellyfish', 'Swimming', 'pulsePower', 'Pulse power', 0.2, 3, 0.05, 1],
+  ['jellyfish', 'Swimming', 'pulseGlow', 'Pulse glow', 0, 3, 0.05, 1], ['jellyfish', 'Swimming', 'tentacles', 'Arm length', 0, 2.5, 0.05, 1],
+  ['dragonflies', 'Flight', 'hover', 'Hover time', 0.1, 4, 0.05, 1.3], ['dragonflies', 'Flight', 'cruising', 'Cruising', 0, 1, 0.01, 0.5],
+  ['dragonflies', 'Flight', 'dart', 'Dart speed', 0.2, 3, 0.05, 1.5], ['dragonflies', 'Flight', 'wingbeat', 'Wingbeat', 0.2, 2, 0.05, 1],
+  ['frogs', 'Leaping', 'hop', 'How often', 0.2, 4, 0.05, 1], ['frogs', 'Leaping', 'leap', 'Leap length', 0.3, 2.5, 0.05, 0.45], ['frogs', 'Leaping', 'height', 'Leap height', 0, 2.5, 0.05, 1],
+  ['cranes', 'Flight', 'wingbeat', 'Wingbeat', 0.3, 2.5, 0.05, 1], ['cranes', 'Flight', 'glide', 'Glide', 0, 4, 0.05, 1], ['cranes', 'Flight', 'foldFlap', 'Folding flap', null, null, null, false],
+  ['crabs', 'Scuttling', 'burst', 'Burst length', 0.2, 4, 0.05, 1], ['crabs', 'Scuttling', 'rest', 'Pause length', 0, 4, 0.05, 1],
+  ['crabs', 'Scuttling', 'legSpeed', 'Leg speed', 0.2, 3, 0.05, 1], ['crabs', 'Scuttling', 'scare', 'Scare', 0, 3, 0.05, 0.55],
+];
+const COUNTS = { butterflies: 22, koi: 22, jellyfish: 22, dragonflies: 22, frogs: 21, cranes: 22, crabs: 23 };
+A.ANIMALS.forEach((id, n) => {
+  const list = A.TWEAKS[id], keys = list.map((t) => t.key);
+  assert.strictEqual(list.length, COUNTS[id], id + ' tweak count');
+  assert.strictEqual(new Set(keys).size, keys.length, id + ' keys are unique');
+  assert.strictEqual(list[0].group, 'Movement'); // the original panel's order: Movement, the animal's own groups, Look
+  assert.strictEqual(list[list.length - 1].group, 'Look');
+  const own = OWN.filter((o) => o[0] === id);
+  assert.deepStrictEqual([...new Set(list.map((t) => t.group))], ['Movement', ...new Set(own.map((o) => o[1])), 'Look'], id + ' group order');
+  for (const key in SHARED) {
+    const t = list.find((x) => x.key === key), want = SHARED[key][n];
+    if (want === null) { assert.ok(!t, id + ' hides ' + key); continue; }
+    assert.ok(t, id + ' shows ' + key);
+    assert.strictEqual(t.def, want, id + ' default ' + key);
+    assert.strictEqual(t.type, key === 'corner' ? 'toggle' : 'range');
+    if (key !== 'corner') assert.deepStrictEqual([t.min, t.max, t.step], RANGE[key], id + ' range ' + key);
+  }
+  for (const [, group, key, label, min, max, step, def] of own) {
+    const t = list.find((x) => x.key === key);
+    assert.ok(t, id + ' own ' + key);
+    assert.deepStrictEqual([t.group, t.label, t.def], [group, label, def], id + ' own ' + key);
+    if (min !== null) assert.deepStrictEqual([t.type, t.min, t.max, t.step], ['range', min, max, step]);
+    else assert.strictEqual(t.type, 'toggle');
+  }
+  assert.strictEqual(own.length + Object.keys(SHARED).filter((k) => SHARED[k][n] !== null).length, list.length, id + ' has nothing else');
+  assert.strictEqual(list.find((t) => t.key === 'direction').disabledWhen, 'corner');
+  for (const t of list) { // defaults inside the ranges, and on the slider grid (so a slider can show them exactly)
+    if (t.type === 'toggle') { assert.strictEqual(typeof t.def, 'boolean'); continue; }
+    assert.ok(t.def >= t.min && t.def <= t.max, id + ' ' + t.key + ' default in range');
+    for (const v of [t.min, t.max, t.def]) assert.ok(Math.abs(v / t.step - Math.round(v / t.step)) < 1e-9, id + ' ' + t.key + ' ' + v + ' on the step grid');
+    assert.strictEqual(t.def, I.species[id].defaults[t.key]); // the schema is the carried-over definitions, not a copy
+  }
+});
+// The chat glass (the search panel on the new tab) and the background tone are global.
+assert.deepStrictEqual(A.GLASS.map((g) => [g.key, g.min, g.max, g.step, g.def]),
+  [['blur', 0, 30, 0.5, 3.5], ['refraction', 0, 150, 1, 40], ['ripple', 0.001, 0.04, 0.001, 0.007], ['tint', 0, 3, 0.05, 0], ['edge', 0, 2, 0.05, 0.55], ['radius', 0, 48, 1, 24], ['width', 320, 960, 10, 720]]);
+assert.deepStrictEqual(A.BACKGROUND, { key: 'background', label: 'Background', group: 'Look', type: 'range', min: 0, max: 1, step: 0.01, def: 0 });
+assert.deepStrictEqual(A.DEFAULTS, { animal: 'butterflies', name: '', background: 0, tuning: {}, glass: { blur: 3.5, refraction: 40, ripple: 0.007, tint: 0, edge: 0.55, radius: 24, width: 720 } });
+
+// ---------- normalize ----------
 const D = A.normalize();
 assert.deepStrictEqual(D, A.DEFAULTS);
-assert.strictEqual(D.animal, 'butterfly');
-assert.deepStrictEqual(Object.keys(D).sort(), ['animal', 'name', ...A.TWEAKS.map((t) => t.key)].sort());
-const expect = { density: 1.05, corner: false, direction: 49, speed: 1.05, sway: 0, spread: 0, size: 1.25, farthest: 0.18, farBias: 1.7, hold: 5, separation: 700,
-  flutter: 0, glide: 2.75, flapRate: 1, hue: 0, shimmer: 0.3, sparkle: 0.12, fade: 0.75, trail: 1.55, trailFade: 0.15, grid: 1.05, detail: 1.3, background: 0,
-  blur: 3.5, refraction: 40, ripple: 0.007, tint: 0, edge: 0.55, radius: 24, width: 720 };
-for (const k in expect) assert.strictEqual(D[k], expect[k], 'default ' + k); // the reference panel's defaults
-assert.strictEqual(A.TWEAKS.length, Object.keys(expect).length);
-for (const t of A.TWEAKS) {
-  if (typeof t.def === 'boolean') continue;
-  assert.strictEqual(A.normalize({ [t.key]: t.max + 1000 })[t.key], t.max, t.key + ' clamps high');
-  assert.strictEqual(A.normalize({ [t.key]: t.min - 1000 })[t.key], t.min, t.key + ' clamps low');
-  for (const junk of ['abc', NaN, null, undefined, '', true]) assert.strictEqual(A.normalize({ [t.key]: junk })[t.key], t.def, t.key + ' junk ' + junk);
-  assert.strictEqual(A.normalize({ [t.key]: String(t.max) })[t.key], t.max, t.key + ' from a query string');
+for (const junk of [null, undefined, 5, 'x', [], true]) assert.deepStrictEqual(A.normalize(junk), A.DEFAULTS);
+// clamping, junk and step snapping, for every tweak of every animal
+for (const id of A.ANIMALS) for (const t of A.TWEAKS[id]) {
+  const one = (v) => A.normalize({ animal: id, tuning: { [id]: { [t.key]: v } } }).tuning[id];
+  if (t.type === 'toggle') {
+    assert.deepStrictEqual(one(!t.def), { [t.key]: !t.def });
+    assert.strictEqual(one(t.def), undefined, 'a default value is not stored');
+    assert.deepStrictEqual(one(t.def ? 'false' : 'true'), { [t.key]: !t.def }); // from a query string
+    continue;
+  }
+  const hi = one(t.max + 1000), lo = one(t.min - 1000);
+  assert.strictEqual(t.max === t.def ? hi : hi[t.key], t.max === t.def ? undefined : t.max, id + ' ' + t.key + ' clamps high');
+  assert.strictEqual(t.min === t.def ? lo : lo[t.key], t.min === t.def ? undefined : t.min, id + ' ' + t.key + ' clamps low');
+  for (const junk of ['abc', NaN, null, undefined, '', true, {}]) assert.strictEqual(one(junk), undefined, id + ' ' + t.key + ' junk ' + String(junk) + ' is the default');
+  assert.strictEqual(one(String(t.max)) && one(String(t.max))[t.key], t.max === t.def ? undefined : t.max, 'from a query string');
+  assert.strictEqual(one(t.def + t.step * 1e-6), undefined, 'a default after rounding is not stored');
 }
-assert.strictEqual(A.normalize({ density: 1.07 }).density, 1.05); // snapped to the 0.05 step
-assert.strictEqual(A.normalize({ ripple: 0.0124 }).ripple, 0.012);
-assert.strictEqual(A.normalize({ direction: 90.4 }).direction, 90);
-assert.strictEqual(A.normalize({ corner: 'true' }).corner, true);
-assert.strictEqual(A.normalize({ corner: '0' }).corner, false);
-assert.strictEqual(A.normalize({ corner: 'maybe' }).corner, false);
-// settings saved by the previous version: count / character size / trail on-off
-assert.strictEqual(A.normalize({ count: 50 }).density, 2.1);
-assert.strictEqual(A.normalize({ count: 25 }).density, 1.05);
-assert.strictEqual(A.normalize({ count: 50, density: 0.5 }).density, 0.5); // a new value wins
-const oldSize = A.normalize({ size: 14 });
-assert.strictEqual(oldSize.size, 1.25);
-assert.strictEqual(oldSize.detail, 0.95); // 10 px cells were detail 1.3; 14 px cells are coarser
-assert.strictEqual(A.normalize({ size: 2 }).size, 2); // a new-range value is a Size
-assert.strictEqual(A.normalize({ trail: false }).trail, 0);
-assert.strictEqual(A.normalize({ trail: 'false' }).trail, 0);
-assert.strictEqual(A.normalize({ trail: 'true' }).trail, 1.55);
-assert.strictEqual(A.normalize({ trail: '3' }).trail, 3);
-assert.strictEqual(A.normalize({ animal: 'Koi' }).animal, 'koi');
-assert.strictEqual(A.normalize({ animal: 'dragon' }).animal, 'butterfly');
-assert.strictEqual(A.normalize({ animal: 'random' }).animal, 'butterfly'); // old saved value: animals are never random now
-assert.strictEqual(A.normalize({ animal: 'RANDOM' }).animal, 'butterfly');
-assert.strictEqual(A.normalize({ animal: 'bird' }).animal, 'crane'); // old saved value
-assert.strictEqual(A.normalize({ animal: 'Crane' }).animal, 'crane');
-assert.ok(!A.ANIMALS.includes('bird') && !A.ANIMALS.includes('random') && A.ANIMALS.length === 7);
-assert.strictEqual(A.normalize({ animal: 'inkkoi' }).animal, 'butterfly'); // old saved value: that animal was removed
-assert.strictEqual(A.normalize({ name: '  Ada  ' }).name, 'Ada');
+assert.deepStrictEqual(A.normalize({ tuning: { butterflies: { density: 1.07, direction: 90.4 } } }).tuning, { butterflies: { direction: 90 } }); // 1.07 snaps to the default 1.05, which is not stored
+assert.deepStrictEqual(A.normalize({ tuning: { koi: { speed: 2.02 } } }).tuning, { koi: { speed: 2 } });
+assert.deepStrictEqual(A.normalize({ glass: { ripple: 0.0124 } }).glass.ripple, 0.012);
+assert.deepStrictEqual(A.normalize({ tuning: { koi: { corner: 'true' } } }).tuning, { koi: { corner: true } });
+assert.deepStrictEqual(A.normalize({ tuning: { koi: { corner: 'maybe' } } }).tuning, {});
+// old ids, any case, are aliases; 'random' and junk give the default; the names are the original's too
+const OLD = { butterfly: 'butterflies', koi: 'koi', jellyfish: 'jellyfish', dragonfly: 'dragonflies', frog: 'frogs', crane: 'cranes', crab: 'crabs', bird: 'cranes' };
+for (const o in OLD) { assert.strictEqual(A.normalize({ animal: o }).animal, OLD[o]); assert.strictEqual(A.normalize({ animal: o.toUpperCase() }).animal, OLD[o]); assert.strictEqual(A.normalize({ animal: ' ' + o + ' ' }).animal, OLD[o]); }
+for (const id of A.ANIMALS) assert.strictEqual(A.normalize({ animal: id }).animal, id);
+for (const junk of ['random', '', 'unicorn', 7, null, undefined, {}]) assert.strictEqual(A.normalize({ animal: junk }).animal, 'butterflies');
+assert.strictEqual(A.normalize({ name: '  Sam  ' }).name, 'Sam');
 assert.strictEqual(A.normalize({ name: 'x'.repeat(100) }).name.length, 40);
-
-// Wallpaper Engine properties -> settings: partial objects map only the keys present; keys are lowercase; no glass
-assert.deepStrictEqual(A.fromWallpaperProps({ speed: { value: 2 } }), { speed: 2 });
-assert.deepStrictEqual(A.fromWallpaperProps({ farbias: { value: 2 }, animal: { value: 'frog' } }), { farBias: 2, animal: 'frog' });
-assert.deepStrictEqual(A.fromWallpaperProps({ corner: { value: true }, trailfade: { value: 1 }, flaprate: { value: 2 } }), { corner: true, trailFade: 1, flapRate: 2 });
-assert.deepStrictEqual(A.fromWallpaperProps({ blur: { value: 9 }, width: { value: 400 }, other: { value: 1 } }), {});
-assert.deepStrictEqual(A.fromWallpaperProps({ density: {} }), {});
-assert.deepStrictEqual(A.fromWallpaperProps({}), {});
-assert.deepStrictEqual(A.fromWallpaperProps(undefined), {});
-assert.strictEqual(A.normalize(A.fromWallpaperProps({ hue: { value: 500 } })).hue, 180);
-// project.json carries the same properties, ranges and defaults (Movement, Flight, Look; no Chat glass, no random)
+assert.strictEqual(A.normalize({ name: null }).name, '');
+// unknown keys are dropped, at every level; a tweak another animal has (or one this animal hides) is not this animal's
+assert.deepStrictEqual(A.normalize({ animal: 'koi', bogus: 1, tuning: { koi: { speed: 2, bogus: 3, glide: 1 }, unicorn: { speed: 2 }, frogs: { grip: 1, hop: 2 } }, glass: { blur: 9, bogus: 1 } }),
+  { animal: 'koi', name: '', background: 0, tuning: { koi: { speed: 2 }, frogs: { hop: 2 } }, glass: Object.assign({}, A.DEFAULTS.glass, { blur: 9 }) });
+// tuning keeps the other animals' values (each animal remembers its own)
+assert.deepStrictEqual(A.normalize({ animal: 'crabs', tuning: { koi: { speed: 2 }, crabs: { burst: 2 } } }).tuning, { koi: { speed: 2 }, crabs: { burst: 2 } });
+// settings of the earlier versions: flat, relative tweaks and flat glass keys. The animal (mapped), name, background and glass are
+// kept; the flat animal tweaks do not map onto the per-animal values and are discarded.
 {
-  const props = JSON.parse(fs.readFileSync(__dirname + '/project.json', 'utf8')).general.properties;
-  assert.deepStrictEqual(props.animal.options.map((o) => o.value), A.ANIMALS);
-  assert.strictEqual(props.animal.value, 'butterfly');
-  const want = A.TWEAKS.filter((t) => t.group !== 'Chat glass');
-  assert.deepStrictEqual(Object.keys(props).sort(), ['animal', ...want.map((t) => t.key.toLowerCase())].sort());
-  for (const t of want) {
-    const p = props[t.key.toLowerCase()];
-    assert.strictEqual(p.value, t.def, t.key);
-    if (typeof t.def === 'boolean') { assert.strictEqual(p.type, 'bool'); continue; }
-    assert.deepStrictEqual([p.type, p.min, p.max, p.step], ['slider', t.min, t.max, t.step], t.key);
-  }
+  const old = { animal: 'dragonfly', name: ' Sam ', density: 3, corner: true, direction: 10, speed: 2, size: 2, hold: 1, flutter: 1, hue: 90, shimmer: 1, trail: 0, fade: 0.2, grid: 2, detail: 2, count: 30,
+    background: 0.4, blur: 10, refraction: 100, ripple: 0.02, tint: 1, edge: 1, radius: 10, width: 500 };
+  assert.deepStrictEqual(A.normalize(old), { animal: 'dragonflies', name: 'Sam', background: 0.4, tuning: {}, glass: { blur: 10, refraction: 100, ripple: 0.02, tint: 1, edge: 1, radius: 10, width: 500 } });
+  assert.deepStrictEqual(A.normalize(Object.assign({}, old, { glass: { blur: 2 } })).glass, Object.assign({}, A.normalize(old).glass, { blur: 2 })); // the new glass object wins over a flat key
+  assert.deepStrictEqual(A.normalize({ animal: 'bird' }), Object.assign({}, A.DEFAULTS, { animal: 'cranes' }));
 }
-
-// line glyphs follow the on-screen angle (y points down)
-assert.strictEqual(A.lineGlyph(0), A.lineGlyph(Math.PI));
-assert.deepStrictEqual([0, Math.PI / 4, Math.PI / 2, -Math.PI / 4].map((t) => ' .:-=+*%#8@0o|/\\{}()§~!•'[A.lineGlyph(t)]), ['-', '\\', '|', '/']);
-
-// ---------- rasteriser ----------
-// every species, every heading, every depth level gives a non-empty list of valid cells
-let sseed = 7;
-const srng = () => ((sseed = (sseed * 16807) % 2147483647) / 2147483647);
-const few = (id, extra) => A.normalize(Object.assign({ animal: id, density: 0.3 }, extra));
-for (const id of A.ANIMALS) {
-  const sp = A.SPECIES[id];
-  const w = A.createWorld(few(id), id, 800, 600, srng);
-  const a = w.animals[0];
-  for (let lvl = 0; lvl < w.levels.length; lvl++) for (let k = 0; k < 16; k++) for (const t of [0, 0.37, 1.9]) {
-    Object.assign(a, { x: 400, y: 300, lvl, dir: (k / 16) * Math.PI * 2 - Math.PI, at: t, spine: null });
-    const n = A.raster(w, a);
-    assert.ok(n > (lvl === 0 ? 25 : 0), id + ' few cells at level ' + lvl + ' heading ' + k + ': ' + n);
-    const cells = new Set();
-    for (let i = 0; i < n; i++) {
-      const c = A.raster.buf.c[i], kind = c >> 16, col = (c >> 8) & 255, g = c & 255;
-      assert.ok(kind >= 1 && kind <= 4 && col < sp.P.cols.length && g < 25, id + ' bad cell code ' + c);
-      const key = A.raster.buf.x[i] + ',' + A.raster.buf.y[i];
-      assert.ok(!cells.has(key), id + ' duplicate cell');
-      cells.add(key);
-    }
-  }
-}
-// the raster box never clips a species: growing it 1.5x adds no cells, over headings, depth and a whole gait cycle
-for (const id of A.ANIMALS) {
-  const sp = A.SPECIES[id];
-  if (!sp.box) continue; // koi are bounded by their spine
-  const w = A.createWorld(few(id), id, 800, 600, srng);
-  const a = w.animals[0], box = sp.box;
-  for (const lvl of [0, 4]) for (let k = 0; k < 16; k++) for (let t = 0; t < 2.5; t += 0.1) {
-    Object.assign(a, { x: 400, y: 300, lvl, dir: (k / 16) * Math.PI * 2, at: t, mode: id === 'frog' ? 'leap' : id === 'crab' ? 'go' : a.mode, timer: 0.5 * ((t * 4) % 1) });
-    sp.box = box; const n = A.raster(w, a);
-    sp.box = box.map((v) => v * 1.5); const m = A.raster(w, a);
-    sp.box = box;
-    assert.strictEqual(n, m, id + ' clipped by its box at heading ' + k + ', level ' + lvl + ', t ' + t.toFixed(1));
-  }
-}
-// koi: same no-clipping check for the spine's row bound (pad), straight and sharply bent; and no body tile strays
-// from the spine farther than the body half-width plus one cell (true point-to-segment distance)
-{
-  const sp = A.SPECIES.koi, w = A.createWorld(few('koi'), 'koi', 800, 600, srng);
-  const a = w.animals[0], u = w.u, pad = sp.pad, nseg = sp.seg;
-  const segDist = (x, y, x1, y1, x2, y2) => {
-    const dx = x2 - x1, dy = y2 - y1, t = Math.max(0, Math.min(1, ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)));
-    return Math.hypot(x - x1 - dx * t, y - y1 - dy * t);
-  };
-  for (const lvl of [0, 4]) for (let k = 0; k < 16; k++) for (const bend of [0, 1.2, 2.4]) for (const eating of [false, true]) {
-    const sc = w.levels[lvl].s, seg = (sp.len * u * sc) / nseg, p = new Float64Array(2 * (nseg + 1));
-    let ang = (k / 16) * Math.PI * 2 + Math.PI, x = 400, y = 300; // spine runs back from the head, turning by `bend` in total
-    for (let j = 0; j <= nseg; j++) { p[2 * j] = x; p[2 * j + 1] = y; x += Math.cos(ang) * seg; y += Math.sin(ang) * seg; if (j === 2) ang += bend; } // one sharp joint, like a feeding turn
-    Object.assign(a, { x: 400, y: 300, lvl, dir: (k / 16) * Math.PI * 2, at: k * 0.3, eating, spine: p, spineU: u });
-    sp.pad = pad; const n = A.raster(w, a);
-    const B = A.raster.buf, limit = (sp.width * u * sc) + Math.max(w.cw, w.ch);
-    for (let i = 0; i < n; i++) {
-      const c = B.c[i];
-      if (c >> 16 !== 1 || ((c >> 8) & 255) >= sp.P.fin[0]) continue; // body tiles only (not fins, tail, eyes)
-      const cx = (B.x[i] + 0.5) * w.cw, cy = (B.y[i] + 0.5) * w.ch;
-      let d = 1e9;
-      for (let j = 0; j < nseg; j++) d = Math.min(d, segDist(cx, cy, p[2 * j], p[2 * j + 1], p[2 * j + 2], p[2 * j + 3]));
-      assert.ok(d <= limit, 'koi body tile ' + d.toFixed(1) + ' px from the spine (limit ' + limit.toFixed(1) + ') at bend ' + bend);
-    }
-    sp.pad = pad * 1.5; const m = A.raster(w, a);
-    sp.pad = pad;
-    assert.strictEqual(n, m, 'koi clipped by its row bound at heading ' + k + ', level ' + lvl + ', bend ' + bend);
-  }
-}
-// eyes: exactly two eye cells (one each), whatever the heading and the sub-cell position (a local box test gave 0 to 4)
-for (const id of ['dragonfly', 'koi', 'frog', 'crane', 'crab']) {
-  const sp = A.SPECIES[id], w = A.createWorld(few(id), id, 800, 600, srng), a = w.animals[0];
-  for (const lvl of [0, 4]) for (const leap of id === 'frog' ? [false, true] : [false]) for (let k = 0; k < 16; k++) for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) {
-    Object.assign(a, { x: 400 + (i / 5) * w.cw, y: 300 + (j / 5) * w.ch, lvl, dir: (k / 16) * Math.PI * 2, at: 0.3, spine: null, mode: leap ? 'leap' : 'rest', timer: 0.25 });
-    const n = A.raster(w, a), B = A.raster.buf, seen = new Set();
-    let eyes = 0;
-    for (let q = 0; q < n; q++) {
-      const key = B.x[q] + ',' + B.y[q];
-      assert.ok(!seen.has(key), id + ' cell emitted twice');
-      seen.add(key);
-      if (B.c[q] === sp.eye) eyes++;
-    }
-    assert.strictEqual(eyes, 2, id + ' has ' + eyes + ' eye cells (heading ' + k + ', offset ' + i + ',' + j + ', level ' + lvl + (leap ? ', leap)' : ')'));
-  }
-}
-// bigger individuals cover more cells (depth reads as size); Size scales bodies, ASCII detail shrinks the cells
-{
-  const cells = (extra, lvl) => {
-    const w = A.createWorld(few('butterfly', extra), 'butterfly', 800, 600, srng);
-    const a = Object.assign(w.animals[0], { x: 400, y: 300, at: 0, ph: 0, gl: 0, lvl, seed: 1, dir: -0.8 });
-    return A.raster(w, a);
-  };
-  assert.ok(cells({}, 0) > 4 * cells({}, 4), 'depth scale');
-  assert.ok(cells({ size: 2.5 }, 0) > 3 * cells({ size: 1.25 }, 0), 'Size');
-  assert.ok(cells({ detail: 2 }, 0) > 2 * cells({ detail: 1.3 }, 0), 'ASCII detail');
-  assert.ok(cells({ farthest: 1 }, 4) === cells({}, 0), 'Farthest depth 1: every level is full size');
-}
-// depth levels: Farthest depth is the far scale, Far bias favours far levels, Distance fade dims them
-{
-  const L = A.levelsFor(A.normalize(), 'butterfly');
-  assert.strictEqual(L.length, 5);
-  assert.ok(L[0].s === 1 && Math.abs(L[4].s - 0.18) < 1e-9 && L[0].dim === 0 && Math.abs(L[4].dim - 0.48) < 1e-9);
-  assert.ok(L[4].w > L[0].w, 'far bias > 1 favours far levels');
-  assert.ok(A.levelsFor(A.normalize({ farBias: 0.5 }), 'butterfly')[4].w < 1);
-  assert.ok(A.levelsFor(A.normalize({ fade: 0 }), 'butterfly').every((l) => l.dim === 0));
-  // per-species reference defaults: a crab's far level is 0.25 at default and still follows the slider
-  assert.ok(Math.abs(A.levelsFor(A.normalize(), 'crab')[4].s - 0.25) < 1e-9);
-  assert.ok(A.levelsFor(A.normalize({ farthest: 0.5 }), 'crab')[4].s > 0.6);
-  // no tweak is dead for any species, including ones whose reference default is 0 (crane trail, jellyfish shimmer)
-  for (const id of A.ANIMALS) for (const k of ['trail', 'shimmer', 'sparkle', 'fade', 'farthest', 'farBias', 'hold', 'trailFade', 'detail', 'sway', 'spread']) {
-    const t = A.TWEAKS.find((x) => x.key === k);
-    assert.notStrictEqual(A.eff(A.normalize({ [k]: t.min }), id, k), A.eff(A.normalize({ [k]: t.max }), id, k), id + ' ' + k + ' is inert');
-  }
-}
-// ... and Hue shift, Shimmer and Sparkle really change what is drawn (cellColor / variantOf are what the renderer uses)
-{
-  const lum = (c) => 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
-  for (const id of A.ANIMALS) {
-    const sp = A.SPECIES[id], tile = (ci) => (1 << 16) | (ci << 8) | 5; // a TILE of palette colour ci
-    const base = (ci) => A.cellColor(sp, tile(ci), 0, 0, 0);
-    const moved = sp.P.cols.filter((_, ci) => Math.max(...A.cellColor(sp, tile(ci), 0, 120, 0).map((v, i) => Math.abs(v - base(ci)[i]))) > 10);
-    assert.ok(moved.length > 0, id + ' Hue shift changes no colour');
-    assert.ok(lum(A.cellColor(sp, tile(0), 0, 0, 1)) > lum(base(0)) && lum(A.cellColor(sp, tile(0), 0, 0, 2)) > lum(A.cellColor(sp, tile(0), 0, 0, 1)), id + ' lit variants are not brighter');
-  }
-  const lit = (extra, t) => { // the variant of every tile on a 60 x 40 patch, at world time t
-    const w = A.createWorld(A.normalize(Object.assign({ animal: 'butterfly' }, extra)), 'butterfly', 800, 600, srng), a = { seed: 7 }; // the same animal every time
-    w.t = t;
-    let out = '';
-    for (let gy = 0; gy < 40; gy++) for (let gx = 0; gx < 60; gx++) out += A.variantOf(w, a, gx, gy, (1 << 16) | 5);
-    return out;
-  };
-  const count = (v, k) => v.split(k).length - 1;
-  const still = lit({ shimmer: 0, sparkle: 0 }, 0);
-  assert.strictEqual(count(still, '0'), 2400, 'Shimmer and Sparkle at 0 light nothing');
-  assert.strictEqual(lit({ shimmer: 0, sparkle: 0 }, 5), still);
-  const sh0 = lit({ shimmer: 1, sparkle: 0 }, 0), sh1 = lit({ shimmer: 1, sparkle: 0 }, 2);
-  assert.ok(count(sh0, '1') > 200 && count(sh0, '2') === 0, 'Shimmer lights a band of tiles: ' + count(sh0, '1'));
-  assert.notStrictEqual(sh0, sh1, 'the Shimmer band does not drift');
-  const sp0 = lit({ shimmer: 0, sparkle: 0.5 }, 0), sp1 = lit({ shimmer: 0, sparkle: 0.5 }, 1);
-  assert.ok(count(sp0, '2') > 20 && count(sp0, '1') === 0, 'Sparkle flashes single tiles: ' + count(sp0, '2'));
-  assert.notStrictEqual(sp0, sp1, 'Sparkle does not change over time');
-  const wl = A.createWorld(A.normalize({ shimmer: 1, sparkle: 0.5 }), 'butterfly', 800, 600, srng);
-  assert.strictEqual(A.variantOf(wl, { seed: 1 }, 3, 4, (2 << 16) | 5), 0, 'only tiles are lit');
-}
-
-// ---------- simulation ----------
-// count: the reference counts (the same at every window size), scaled by Density and, above the default Size, by 1/Size^2
-const counts = { butterfly: 16, koi: 23, jellyfish: 10, dragonfly: 9, frog: 13, crane: 9, crab: 21 };
-for (const id in counts) assert.strictEqual(A.countFor(A.normalize(), id), counts[id], id);
-assert.strictEqual(A.countFor(A.normalize({ density: 2.1 }), 'butterfly'), 32);
-assert.strictEqual(A.countFor(A.normalize({ size: 2.5 }), 'koi'), 6); // 23 / 4
-assert.strictEqual(A.countFor(A.normalize({ size: 0.3 }), 'koi'), 23); // smaller bodies do not add animals
-assert.ok(A.countFor(A.normalize({ density: 0.1 }), 'crane') >= 1);
-for (const id of A.ANIMALS) assert.ok(A.countFor(A.normalize({ density: 4, size: 0.3 }), id) <= 120, id + ' worst-case count is capped');
-// the scene scales with the window width (measured on the reference): 160 columns of cells at ASCII detail 1.3, character-shaped,
-// bodies the same size in cells, the same number of animals
-for (const [w, h, pitch] of [[760, 460, [5, 7]], [1440, 870, [9, 13]], [1920, 1080, [12, 17]]]) for (const id of ['koi', 'butterfly']) {
-  const world = A.createWorld(A.normalize({ animal: id }), id, w, h, srng);
-  assert.deepStrictEqual([Math.round(world.cw), Math.round(world.ch)], pitch, id + ' cell pitch at ' + w);
-  assert.ok(Math.abs(world.cw * 160 - w) < 1e-6 && Math.abs(world.u / world.cw - 1) < 1e-9, 'grid and bodies follow the width at ' + w);
-  assert.strictEqual(world.animals.length, counts[id]);
-}
-{
-  const small = A.createWorld(A.normalize({ detail: 2 }), 'koi', 760, 460, srng), big = A.createWorld(A.normalize({ detail: 2 }), 'koi', 1920, 1080, srng);
-  assert.ok(Math.abs((small.cw * 160) / 760 - 1.3 / 2) < 1e-9 && Math.abs(small.u / small.cw - big.u / big.cw) < 1e-9, 'ASCII detail multiplies the column count');
-  assert.ok(A.createWorld(A.normalize(), 'koi', 0, 0, srng).cw > 0, 'a 0-sized first layout still has a grid');
-}
-
-// every species stays finite and inside the wrap bounds, including huge/zero/NaN dt, at several headings
-let seed = 1;
-const rng = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-for (const id of A.ANIMALS) for (const direction of [49, 0, 135, 270]) {
-  const s = A.normalize({ animal: id, density: 2, direction, sway: 0.6, flutter: 3, spread: 0.8 });
-  const world = A.createWorld(s, id, 800, 600, rng);
-  assert.strictEqual(world.animals.length, A.countFor(s, id));
-  A.poke(world, 400, 300);
-  for (const dt of [0.016, 0.016, 10, 0, NaN, -1, ...Array(300).fill(0.016)]) A.step(world, dt);
-  for (const a of world.animals) {
-    const m = (A.SPECIES[id].reach * world.levels[a.lvl].s + 2) * world.u;
-    for (const v of [a.x, a.y, a.dir, a.ang, a.sp, a.kx, a.ky, a.gl]) assert.ok(Number.isFinite(v), id + ' NaN/Infinity');
-    assert.ok(a.x >= -m && a.x <= 800 + m && a.y >= -m && a.y <= 600 + m, id + ' out of bounds');
-    if (a.spine) assert.ok(a.spine.every(Number.isFinite), id + ' spine NaN');
-    assert.ok(A.raster(world, a) > 0, id + ' empty after stepping');
-  }
-}
-
-// undisturbed, the whole swarm faces one common heading: Direction (degrees, counter-clockwise from +x, screen up)
-// or, with Corner to corner, the bottom-left to top-right diagonal; animals keep streaming across the screen
-for (const id of A.ANIMALS) for (const [direction, corner] of [[49, false], [0, false], [90, false], [200, false], [300, false], [49, true]]) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 2, direction, corner }), id, 1440, 870, rng);
-  const want = corner ? Math.atan2(-870, 1440) : (-direction * Math.PI) / 180;
-  assert.ok(Math.abs(Math.cos(world.heading - want) - 1) < 1e-9, 'heading ' + direction);
-  for (let i = 0; i < 400; i++) A.step(world, 0.05);
-  for (const a of world.animals) assert.ok(Math.cos(a.dir - want) > 0.97, id + ' strays from the common heading ' + direction + (corner ? ' corner' : ''));
-  const visible = (a) => { // at least one cell on screen
-    const n = A.raster(world, a), B = A.raster.buf;
-    for (let i = 0; i < n; i++) if (B.x[i] >= 0 && B.y[i] >= 0 && B.x[i] * world.cw < 1440 && B.y[i] * world.ch < 870) return true;
-    return false;
-  };
-  const onScreen = world.animals.filter(visible).length;
-  assert.ok(onScreen >= 0.5 * world.animals.length, id + ' piles up off screen at ' + direction + ': ' + onScreen + ' of ' + world.animals.length);
-}
-assert.ok(Math.sin(A.createWorld(A.normalize({ direction: 90 }), 'koi', 800, 600, rng).heading) < -0.99, '90 degrees is straight up');
-
-// spacing: a swarm squeezed into a small clump (twice the default density) spreads out under the separation force: five
-// seconds later same-depth neighbours are much farther apart (nearest one, in units of their spacing radii) than with
-// the force switched off, and the swarm still holds the common heading
-const radius = (w, a) => A.SPECIES[w.animal].space * w.levels[a.lvl].s * w.u;
-for (const id of A.ANIMALS) {
-  const nearest = (off) => {
-    let sd = 1;
-    const r = () => ((sd = (sd * 16807) % 2147483647) / 2147483647);
-    const world = A.createWorld(A.normalize({ animal: id, density: 2.1 }), id, 1440, 870, r);
-    world.animals.forEach((a, i) => { a.x = 600 + (i % 6) * 10; a.y = 400 + Math.floor(i / 6) * 10; a.spine = null; });
-    if (off) world.sep = 0;
-    for (let i = 0; i < 100; i++) A.step(world, 0.05);
-    let sum = 0, n = 0;
-    for (const a of world.animals) {
-      let best = Infinity;
-      for (const b of world.animals) if (a !== b && a.lvl === b.lvl) best = Math.min(best, Math.hypot(a.x - b.x, a.y - b.y) / (radius(world, a) + radius(world, b)));
-      if (best < Infinity) { sum += best; n++; }
-    }
-    for (const a of world.animals) assert.ok(Math.cos(a.dir - world.heading) > 0.97, id + ' spacing bent the heading');
-    return sum / n;
-  };
-  const on = nearest(false), off = nearest(true);
-  assert.ok(on > 1.5 * off, id + ' separation does not spread a clump: ' + on.toFixed(2) + ' vs ' + off.toFixed(2) + ' without it');
-}
-
-// ... and the cruising separation force pulls a crowded pair apart (sideways, keeping the heading)
-for (const id of A.ANIMALS) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 0.1 }), id, 1440, 870, rng);
-  const [a, b] = world.animals.length > 1 ? world.animals : [world.animals[0], A.createWorld(A.normalize({ animal: id }), id, 1440, 870, rng).animals[0]];
-  world.animals = [a, b];
-  Object.assign(a, { x: 700, y: 450, lvl: 1, dir: world.heading }); Object.assign(b, { x: 712, y: 452, lvl: 1, dir: world.heading, spine: null });
-  a.spine = null;
-  for (let i = 0; i < 800; i++) A.step(world, 0.05); // 40 s: the sideways push is capped (about 10 degrees), so a pair parts slowly
-  const r = Math.hypot(a.x - b.x, a.y - b.y) / (radius(world, a) + radius(world, b));
-  assert.ok(r >= 1, id + ' crowded pair stays together: ' + r.toFixed(2));
-  for (const c of [a, b]) assert.ok(Math.cos(c.dir - world.heading) > 0.97, id + ' separation bent the heading');
-}
-
-// the sideways separation push never turns an animal's travel direction more than ~10 degrees off its own heading
-// (Density 4, Separation 1000: the push used to be uncapped and sent animals 40-90 degrees sideways)
-for (const id of A.ANIMALS) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 4, separation: 1000 }), id, 1440, 870, rng);
-  for (let i = 0; i < 100; i++) A.step(world, 0.05);
-  let worst = 0, moves = 0;
-  for (let i = 0; i < 300; i++) {
-    const p = world.animals.map((a) => [a.x, a.y]);
-    A.step(world, 0.05);
-    world.animals.forEach((a, j) => {
-      const dx = a.x - p[j][0], dy = a.y - p[j][1], d = Math.hypot(dx, dy);
-      if (d < 1e-6 || d > 2 * world.u) return; // resting, or re-entered at the far edge
-      moves++;
-      worst = Math.max(worst, Math.acos(Math.min(1, (dx * Math.cos(a.dir) + dy * Math.sin(a.dir)) / d)));
-    });
-  }
-  assert.ok(moves > 100 && worst < (10.5 * Math.PI) / 180, id + ' sideways push bends the travel direction by ' + ((worst * 180) / Math.PI).toFixed(1) + ' degrees');
-}
-
-// occlusion: forced overlaps (same centre, different depth): no cell is drawn by two animals, and a farther animal
-// draws nothing inside the nearer one's silhouette grown by one cell around its tiles (the moat)
-for (const id of A.ANIMALS) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 2 }), id, 800, 600, srng), pair = world.animals.slice(0, 2);
-  for (const [lf, ln, dx] of [[2, 0, 0], [4, 1, 30], [1, 0, -25]]) {
-    const far = Object.assign(pair[0], { x: 400 + dx * (world.u / 9), y: 300, lvl: lf, dir: -0.8, spine: null });
-    const near = Object.assign(pair[1], { x: 400, y: 300, lvl: ln, dir: -0.8, spine: null });
-    world.animals.length = 2; world.animals[0] = far; world.animals[1] = near; // far-first, as configure sorts them
-    const n = A.raster(world, near), moat = new Set(), TILE = 1, EYE = 4;
-    for (let i = 0; i < n; i++) {
-      const x = A.raster.buf.x[i], y = A.raster.buf.y[i], kind = A.raster.buf.c[i] >> 16;
-      if (kind !== TILE && kind !== EYE) { moat.add(x + ',' + y); continue; }
-      for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) moat.add(x + ox + ',' + (y + oy));
-    }
-    const seen = new Map();
-    let farCells = 0, farHidden = 0;
-    A.compose(world, (a, gx, gy) => {
-      const key = gx + ',' + gy;
-      assert.ok(!seen.has(key), id + ' cell ' + key + ' drawn twice');
-      seen.set(key, a);
-      if (a === far) { farCells++; assert.ok(!moat.has(key), id + ' far animal draws inside the near one\'s moat at ' + key); }
-    });
-    A.raster(world, far);
-    for (let i = 0; i < A.raster.buf.n; i++) if (moat.has(A.raster.buf.x[i] + ',' + A.raster.buf.y[i])) farHidden++;
-    assert.ok(farHidden > 0, id + ' test did not overlap'); // the case is really an overlap
-    assert.ok([...seen.values()].includes(near));
-  }
-}
-
-// click: others turn away from the point, then curve back to the common heading
-const crab = A.createWorld(A.normalize({ animal: 'crab', density: 3 }), 'crab', 800, 600, rng);
-Object.assign(crab.animals[0], { x: 410, y: 300 });
-A.poke(crab, 400, 300);
-assert.ok(crab.animals[0].kx > 0 && Math.abs(crab.animals[0].fleeDir) < 0.01);
-for (let i = 0; i < 6; i++) A.step(crab, 0.05);
-assert.ok(Math.cos(crab.animals[0].dir) > 0.9, 'turned away from the click');
-for (let i = 0; i < 80; i++) A.step(crab, 0.05);
-assert.ok(Math.cos(crab.animals[0].dir - crab.heading) > 0.97, 'rejoined the heading');
-
-// koi (in a 1440 px wide world, where a body unit is 9 px): a click drops food (which fades away); a nearby koi turns to it, its body bends, and it eats
-const koi = A.createWorld(few('koi'), 'koi', 1440, 870, rng);
-koi.animals.length = 1;
-const fish = Object.assign(koi.animals[0], { x: 300, y: 300, dir: -Math.PI / 4, lvl: 0, spine: null });
-A.step(koi, 0.016);
-A.poke(koi, 300, 420); // food straight below the fish, far off its heading
-const n0 = koi.pellets.length;
-assert.ok(n0 > 0 && koi.ripples.length === 1);
-let bent = 0;
-const seg = (A.SPECIES.koi.len * koi.u) / A.SPECIES.koi.seg;
-for (let i = 0; i < 60; i++) {
-  A.step(koi, 0.05);
-  const p = fish.spine, head = Math.atan2(p[1] - p[3], p[0] - p[2]), tail = Math.atan2(p[p.length - 3] - p[p.length - 1], p[p.length - 4] - p[p.length - 2]);
-  bent = Math.max(bent, Math.abs(Math.atan2(Math.sin(head - tail), Math.cos(head - tail))));
-  for (let j = 2; j < p.length; j += 2) assert.ok(Math.hypot(p[j] - p[j - 2], p[j + 1] - p[j - 1]) < 2 * seg, 'spine stretched');
-}
-assert.ok(fish.eating && Math.sin(fish.dir) > 0, 'koi turns toward the food');
-assert.ok(bent > 0.4, 'koi body bends while turning: ' + bent);
-// it eats: pellets disappear long before their 7 s natural expiry (3 s have passed)
-assert.ok(koi.pellets.length < n0, 'koi ate nothing: ' + koi.pellets.length + ' of ' + n0 + ' left');
-for (let i = 0; i < 700; i++) A.step(koi, 0.05);
-assert.ok(koi.pellets.length === 0 && koi.ripples.length === 0);
-// a re-entering koi carries its whole spine across the edge: right after the jump the body still lies along the heading
-Object.assign(fish, { x: 1300, y: 300, dir: koi.heading, bias: 0, spine: null });
-A.step(koi, 0.016);
-let wrapped = false;
-for (let i = 0; i < 600 && !wrapped; i++) {
-  const x0 = fish.x, y0 = fish.y;
-  A.step(koi, 0.05);
-  if (Math.hypot(fish.x - x0, fish.y - y0) < 100) continue;
-  wrapped = true;
-  const p = fish.spine, n = p.length, body = Math.atan2(p[1] - p[n - 1], p[0] - p[n - 2]);
-  assert.ok(Math.abs(Math.atan2(Math.sin(body - fish.dir), Math.cos(body - fish.dir))) < 0.2, 'body twisted across a wrap: ' + body + ' vs ' + fish.dir);
-}
-assert.ok(wrapped, 'koi never wrapped');
-
-// weighted varieties: kohaku koi are the most common
-const kw = A.createWorld(A.normalize({ animal: 'koi', density: 4 }), 'koi', 2880, 1740, rng);
-const vc = [0, 0, 0, 0];
-for (const a of kw.animals) vc[a.pal]++;
-assert.ok(vc[0] > vc[1] && vc[1] > vc[3] && vc.every((c) => c > 0), 'variety weights ' + vc);
-
-// trails: with a trail, every species builds up a wake (in-bounds steps must not count as wraps)
-for (const id of A.ANIMALS) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 2, trail: 4 }), id, 1440, 870, rng);
-  for (let i = 0; i < 200; i++) A.step(world, 0.05);
-  const long = world.animals.filter((a) => a.trail.length > 1).length;
-  assert.ok(long >= 0.8 * world.animals.length, id + ' trails keep resetting: ' + long + ' of ' + world.animals.length);
-}
-// no points are recorded when trail is 0 (or an old "off")
-for (const trail of [0, false]) {
-  const nt = A.createWorld(A.normalize({ animal: 'koi', trail }), 'koi', 800, 600, rng);
-  for (let i = 0; i < 50; i++) A.step(nt, 0.016);
-  assert.ok(nt.animals.every((a) => a.trail.length === 0));
-}
-
-// Glide: with glide 0 nobody glides; at the default some do; Flap rate speeds up the animation clock
-for (const glide of [0, 2.75]) {
-  const w = A.createWorld(A.normalize({ glide, density: 3 }), 'butterfly', 1440, 870, rng);
-  let gl = 0;
-  for (let i = 0; i < 200; i++) { A.step(w, 0.05); gl = Math.max(gl, ...w.animals.map((a) => a.gl)); }
-  assert.ok(glide ? gl > 0.9 : gl === 0, 'glide ' + glide + ': ' + gl);
-}
-{
-  const w = A.createWorld(A.normalize({ flapRate: 3 }), 'butterfly', 800, 600, rng), a = w.animals[0], t0 = a.at;
-  A.step(w, 0.05);
-  assert.ok(Math.abs(a.at - t0 - 0.05 * 3 * w.speed) < 1e-9);
-}
-
-// Far bias applies to a running swarm, not only to new arrivals
-{
-  const w = A.createWorld(A.normalize({ density: 4, farBias: 0.3 }), 'butterfly', 1440, 870, rng);
-  const mean = () => w.animals.reduce((n, a) => n + a.lvl, 0) / w.animals.length, m0 = mean();
-  A.configure(w, A.normalize({ density: 4, farBias: 3 }), 'butterfly');
-  assert.ok(mean() > m0 + 0.5, 'far bias did not move the running swarm: ' + m0.toFixed(2) + ' -> ' + mean().toFixed(2));
-  for (let i = 1; i < w.animals.length; i++) assert.ok(w.animals[i - 1].lvl >= w.animals[i].lvl, 'still drawn far-first');
-}
-
-// lowering Density (or shrinking the window) keeps every depth level that existed, not just the far ones
-for (const id of ['butterfly', 'koi']) {
-  const world = A.createWorld(A.normalize({ animal: id, density: 4 }), id, 3840, 2160, rng);
-  const before = new Set(world.animals.map((a) => a.lvl));
-  A.configure(world, A.normalize({ density: 0.5 }), id);
-  const n = world.animals.length, after = new Set(world.animals.map((a) => a.lvl));
-  assert.ok(n >= 5 && n === A.countFor(A.normalize({ density: 0.5 }), id));
-  for (const l of before) assert.ok(after.has(l), id + ' lost every animal at depth ' + l);
-  for (let i = 1; i < n; i++) assert.ok(world.animals[i - 1].lvl >= world.animals[i].lvl, 'still drawn far-first');
-}
-
-// ---------- background tone ----------
-// Background: 0..1, default 0; 0 = the old near-black colour exactly, 1 = white, between = neutral greys
-assert.deepStrictEqual(A.TWEAKS.find((t) => t.key === 'background'), { key: 'background', label: 'Background', group: 'Look', min: 0, max: 1, step: 0.01, def: 0 });
-assert.strictEqual(D.background, 0);
+// background
 assert.strictEqual(A.normalize({ background: 2 }).background, 1);
 assert.strictEqual(A.normalize({ background: -3 }).background, 0);
 assert.strictEqual(A.normalize({ background: '0.5' }).background, 0.5);
 assert.strictEqual(A.normalize({ background: 0.123 }).background, 0.12);
-assert.deepStrictEqual(A.fromWallpaperProps({ background: { value: 0.4 } }), { background: 0.4 });
-assert.strictEqual(A.normalize(A.fromWallpaperProps({ background: { value: 9 } })).background, 1);
-const TONES = [0, 0.25, 0.5, 0.75, 1], bgAt = (t) => A.backgroundOf({ background: t });
-assert.deepStrictEqual(bgAt(0).rgb, [8, 9, 13]); // the former BG #08090d
-assert.deepStrictEqual(bgAt(1).rgb, [255, 255, 255]);
-assert.deepStrictEqual(A.backgroundOf({}).rgb, [8, 9, 13]);
-assert.strictEqual(A.backgroundOf({ background: '1' }).css, 'rgb(255,255,255)'); // query-string shape
-for (const t of [0.25, 0.5, 0.75]) { const c = bgAt(t).rgb; assert.ok(Math.max(...c) - Math.min(...c) <= 6 && c[0] > 8 && c[0] < 255, 'grey at ' + t); }
-assert.deepStrictEqual(TONES.map((t) => bgAt(t).light), [false, false, true, true, true]); // the flip is at luminance 0.179, where black and white contrast equally
+assert.strictEqual(A.normalize({ background: 'dark' }).background, 0);
+// whatever normalize returns is stable, and JSON-safe (it is what chrome.storage keeps)
 {
-  const hx = (c) => [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)), mx = (c, d, t) => c.map((v, i) => Math.round(v + (d[i] - v) * t));
-  const old = (sp, code, dim, hue, variant) => { // cellColor as it was before the Background tweak
-    const kind = code >> 16, col = mx(kind === 4 ? [238, 238, 238] : A.hueRotate(hx(sp.P.cols[(code >> 8) & 255]), hue), [8, 9, 13], kind === 2 ? 0.55 + dim * 0.4 : dim);
-    return variant ? mx(col, [255, 255, 255], variant === 1 ? 0.3 : 0.8) : col;
-  };
-  const L0 = A.lookOf(0);
-  for (const id of A.ANIMALS) {
-    const sp = A.SPECIES[id];
-    for (let ci = 0; ci < sp.P.cols.length; ci++) for (const kind of [1, 2, 3, 4]) for (const dim of [0, 0.3, 0.64]) for (const hue of [0, 50]) for (const v of kind === 1 ? [0, 1, 2] : [0]) {
-      const code = (kind << 16) | (ci << 8) | 5;
-      assert.deepStrictEqual(A.cellColor(sp, code, dim, hue, v), old(sp, code, dim, hue, v), 'default look unchanged: ' + id + ' ' + ci + ' ' + kind);
-      assert.deepStrictEqual(A.cellColor(sp, code, dim, hue, v, L0), old(sp, code, dim, hue, v));
-    }
-  }
-  assert.deepStrictEqual([L0.css, L0.grid, L0.pupil, L0.lit, L0.ripple], ['rgb(8,9,13)', [140, 150, 185], [12, 12, 14], [255, 255, 255], 'rgb(200,204,216)']); // grid rgba(140,150,185,..), pupil, ripple #c8ccd8 as before
+  const s = A.normalize({ animal: 'jellyfish', name: 'Ann', background: 0.3, tuning: { jellyfish: { pulseRate: 1.5, trail: 2 } } });
+  assert.deepStrictEqual(A.normalize(s), s);
+  assert.deepStrictEqual(A.normalize(JSON.parse(JSON.stringify(s))), s);
 }
-// light-on-dark parts stay readable at every tone: each bare glyph colour (antennae, tentacles, wing veins, legs, toes, dots, trail, pellets)
-// keeps min(its contrast on the default background, 2.5):1 against the actual background (3% slack for 8-bit rounding), eye tiles >= 4.5:1
-// and their pupils >= 4.5:1 on the tile, the grid lines stay between 1.01:1 and 1.12:1 (lighter on dark, darker on light)
+// the preview in a plain browser: ?animal=koi&background=0.5&speed=1.4 (absolute values for that animal)
+assert.deepStrictEqual(A.fromQuery('?animal=koi&background=0.5&speed=1.4&width=500&name=Sam'),
+  A.normalize({ animal: 'koi', name: 'Sam', background: 0.5, tuning: { koi: { speed: 1.4 } }, glass: { width: 500 } }));
+assert.deepStrictEqual(A.fromQuery(''), A.DEFAULTS);
+assert.deepStrictEqual(A.fromQuery('animal=frog&hop=2&glide=3&speed=9').tuning, { frogs: { hop: 2, speed: 3 } }); // glide is not a frog tweak; clamped
+assert.deepStrictEqual(A.fromQuery({ animal: 'cranes', foldFlap: 'true' }).tuning, { cranes: { foldFlap: true } });
+assert.deepStrictEqual(A.fromQuery(new URLSearchParams('animal=crab&scare=2')).tuning, { crabs: { scare: 2 } });
+
+// ---------- Wallpaper Engine ----------
+// A short, species-independent set; density, speed, size, trail, grid and detail multiply the animal's original defaults, hueshift is absolute.
+const WE = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { value: v }]));
+const tuningOf = (animal, props, base) => A.fromWallpaperProps(Object.assign({ animal: { value: animal } }, WE(props)), base).tuning[animal];
+assert.deepStrictEqual(A.fromWallpaperProps({}), A.DEFAULTS);
+assert.deepStrictEqual(A.fromWallpaperProps(WE({ animal: 'koi', background: 0.4 })), Object.assign({}, A.DEFAULTS, { animal: 'koi', background: 0.4 }));
+assert.deepStrictEqual(tuningOf('koi', { density: 1, speed: 1, size: 1, hueshift: 0, trail: 1, grid: 1, detail: 1 }), undefined, 'the neutral values are the original look');
+assert.deepStrictEqual(tuningOf('koi', { speed: 1.25 }), { speed: 2 }); // 1.6 x 1.25
+assert.deepStrictEqual(tuningOf('butterflies', { density: 2, size: 0.8 }), { density: 2.1, size: 1 }); // 1.05 x 2, 1.25 x 0.8
+assert.deepStrictEqual(tuningOf('dragonflies', { hueshift: 90, detail: 1.5 }), { hueShift: 90, detail: 1.95 });
+assert.deepStrictEqual(tuningOf('crabs', { grid: 2, trail: 0.5 }), { grid: 2.1, trail: 0.6 });
+assert.deepStrictEqual(tuningOf('koi', { density: 3, speed: 3 }), { density: 4, speed: 3 }); // clamped to the original's range after multiplying (1.6 x 3 = 4.8)
+assert.deepStrictEqual(tuningOf('koi', { trail: 3 }), undefined); // 4 x 3 -> 4: the default again
+assert.deepStrictEqual(tuningOf('cranes', { trail: 3 }), undefined); // the crane's trail default is 0: a multiplier leaves it
+assert.deepStrictEqual(tuningOf('frogs', { hueshift: 999 }), { hueShift: 180 });
+assert.deepStrictEqual(tuningOf('frogs', { hueshift: -999 }), { hueShift: -180 });
+assert.deepStrictEqual(tuningOf('koi', { speed: 'abc', size: null }), undefined); // junk is ignored
+// plain values work as well as {value}; unknown properties are ignored
+assert.deepStrictEqual(A.fromWallpaperProps({ animal: 'koi', speed: 1.25, bogus: 4 }).tuning, { koi: { speed: 2 } });
+// Wallpaper Engine sends only what changed: the host keeps every property seen, so a new animal gets the multipliers against its own defaults
 {
-  const BARE_KEYS = { butterfly: ['ant', 'trail'], jellyfish: ['dots', 'tent', 'streak', 'trail'], dragonfly: ['wing', 'trail'], koi: ['eye', 'dot', 'food', 'trail'],
-    frog: ['toe', 'trail'], crane: ['eye', 'beak', 'leg', 'trail'], crab: ['eye', 'leg', 'trail'] };
-  const L0 = A.lookOf(0), cr = A.contrast;
-  for (const t of TONES) {
-    const b = bgAt(t);
-    for (const id of A.ANIMALS) {
-      const sp = A.SPECIES[id];
-      for (const key of BARE_KEYS[id]) for (let ci = sp.P[key][0]; ci < sp.P[key][0] + sp.P[key][1]; ci++) {
-        const code = (3 << 16) | (ci << 8) | 5, want = Math.min(cr(A.cellColor(sp, code, 0, 0, 0, L0), L0.rgb), 2.5);
-        assert.ok(cr(A.cellColor(sp, code, 0, 0, 0, b), b.rgb) >= want * 0.97, id + ' ' + key + ' bare glyph contrast at ' + t);
-      }
-      const eye = A.cellColor(sp, (4 << 16) | 5, 0, 0, 0, b);
-      assert.ok(cr(eye, b.rgb) >= 4.5 && cr(b.pupil, eye) >= 4.5, id + ' eye tile at ' + t);
+  const seen = {};
+  Object.assign(seen, WE({ animal: 'koi', speed: 1.25 }));
+  assert.deepStrictEqual(A.fromWallpaperProps(seen).tuning, { koi: { speed: 2 } });
+  Object.assign(seen, WE({ animal: 'cranes' })); // only the animal changed
+  assert.deepStrictEqual(A.fromWallpaperProps(seen).tuning, { cranes: { speed: 1.9 } }); // 1.5 x 1.25 = 1.875 -> the 0.05 step
+  Object.assign(seen, WE({ background: 0.7 }));
+  assert.strictEqual(A.fromWallpaperProps(seen).background, 0.7);
+  assert.strictEqual(A.fromWallpaperProps(seen).animal, 'cranes');
+}
+// the base (the ?query preview) supplies what Wallpaper Engine does not send, and loses to what it sends
+{
+  const base = A.fromQuery('animal=koi&speed=1.4&background=0.2&detail=1.5');
+  assert.deepStrictEqual(A.fromWallpaperProps({}, base), base);
+  assert.deepStrictEqual(A.fromWallpaperProps(WE({ speed: 1 }), base).tuning, { koi: { detail: 1.5 } });
+  assert.strictEqual(A.fromWallpaperProps(WE({ background: 0.9 }), base).background, 0.9);
+  assert.strictEqual(A.fromWallpaperProps(WE({ animal: 'frog' }), base).animal, 'frogs');
+}
+// project.json carries exactly these properties, with their ranges and neutral defaults
+{
+  const project = JSON.parse(fs.readFileSync('project.json', 'utf8')), props = project.general.properties;
+  assert.deepStrictEqual(Object.keys(props), ['animal', 'background', ...A.WALLPAPER.map((w) => w.prop)]);
+  assert.deepStrictEqual(props.animal.options, A.ANIMALS.map((id) => ({ label: A.LABELS[id], value: id })));
+  assert.strictEqual(props.animal.type, 'combo');
+  assert.strictEqual(props.animal.value, A.DEFAULTS.animal);
+  assert.deepStrictEqual([props.background.type, props.background.min, props.background.max, props.background.value], ['slider', 0, 1, 0]);
+  for (const w of A.WALLPAPER) {
+    const p = props[w.prop];
+    assert.deepStrictEqual([p.type, p.min, p.max, p.step, p.value], ['slider', w.min, w.max, w.step, w.def], w.prop);
+    assert.ok(w.def >= w.min && w.def <= w.max);
+    for (const id of A.ANIMALS) { // the extremes of the property end inside the animal's own range after clamping
+      const t = A.TWEAKS[id].find((x) => x.key === w.key), lim = (v) => (A.fromWallpaperProps(WE({ animal: id, [w.prop]: v })).tuning[id] || {})[w.key];
+      assert.ok(t, id + ' has ' + w.key);
+      for (const v of [w.min, w.max]) { const got = lim(v) === undefined ? t.def : lim(v); assert.ok(got >= t.min && got <= t.max, id + ' ' + w.prop + ' ' + v); }
     }
-    assert.ok(cr(b.ripple.match(/\d+/g).map(Number), b.rgb) >= 4.5, 'ripple dots at ' + t);
-    const line = b.rgb.map((v, i) => Math.round(v + (b.grid[i] - v) * 0.03)), g = cr(line, b.rgb);
-    assert.ok(g >= 1.01 && g <= 1.12 && (A.lumOf(line) > b.lum) === !b.light, 'grid contrast at ' + t + ': ' + g);
   }
+  const orders = Object.values(props).map((p) => p.order);
+  assert.deepStrictEqual(orders, [...orders].sort((a, b) => a - b));
+  // all the project's own default values, as Wallpaper Engine sends them first, give the original look of the animal
+  const first = Object.fromEntries(Object.entries(props).map(([k, p]) => [k, { value: p.value }]));
+  assert.deepStrictEqual(A.fromWallpaperProps(first), A.DEFAULTS);
+  for (const id of A.ANIMALS) assert.deepStrictEqual(A.fromWallpaperProps(Object.assign({}, first, { animal: { value: id } })), Object.assign({}, A.DEFAULTS, { animal: id }));
+  for (const k of ['title', 'file', 'type', 'preview']) assert.ok(project[k], k);
+  assert.ok(fs.existsSync(project.file) && fs.existsSync(project.preview));
+}
+
+// ---------- background tone ----------
+const TONES = [0, 0.25, 0.5, 0.75, 1], bgAt = (t) => A.backgroundOf({ background: t });
+assert.deepStrictEqual(bgAt(0).rgb, [6, 7, 12]); // the original's dark background
+assert.deepStrictEqual(bgAt(1).rgb, [255, 255, 255]);
+assert.deepStrictEqual(A.backgroundOf({}).rgb, [6, 7, 12]);
+assert.strictEqual(A.backgroundOf({ background: '1' }).css, 'rgb(255,255,255)'); // query-string shape
+assert.strictEqual(bgAt(0).css, 'rgb(6,7,12)');
+for (const t of [0.25, 0.5, 0.75]) { const c = bgAt(t).rgb; assert.ok(Math.max(...c) - Math.min(...c) <= 8 && c[0] > 6 && c[0] < 255, 'near-grey at ' + t); }
+for (let i = 1; i <= 100; i++) { const a = bgAt((i - 1) / 100).lum, b = bgAt(i / 100).lum; assert.ok(b > a, 'darker to lighter'); }
+assert.deepStrictEqual(TONES.map((t) => bgAt(t).light), [false, false, true, true, true]); // the UI flips at luminance 0.179, where black and white contrast equally
+assert.deepStrictEqual(TONES.map((t) => bgAt(t).theme), ['dark', 'dark', 'light', 'light', 'light']); // the renderer's palette: the one whose ink contrasts more
+for (const t of TONES) assert.ok(Object.keys(bgAt(t)).includes('adapt') && typeof bgAt(t).adapt === 'function');
+{
+  // tone 0: the original dark palette object itself (same values, nothing remapped)
+  const L0 = A.lookOf(0);
+  assert.strictEqual(L0.palette, I.palettes.dark);
+  assert.deepStrictEqual(L0.palette, { background: [6, 7, 12], grid: [255, 255, 255, 0.055], trailAlpha: 0.85, ink: [150, 160, 200] });
+  assert.deepStrictEqual(I.palettes.light, { background: [246, 243, 236], grid: [30, 34, 60, 0.07], trailAlpha: 0.7, ink: [42, 42, 59] }); // and the light one is untouched
+  // above 0: the original palette of the chosen theme with the background replaced
+  const L5 = A.lookOf(0.5), L1 = A.lookOf(1);
+  assert.deepStrictEqual(L5.palette, Object.assign({}, I.palettes.light, { background: L5.rgb }));
+  assert.deepStrictEqual(L1.palette, Object.assign({}, I.palettes.light, { background: [255, 255, 255] }));
+  assert.deepStrictEqual(A.lookOf(0.1).palette, Object.assign({}, I.palettes.dark, { background: A.lookOf(0.1).rgb }));
+  // the chosen theme is the one whose ink has the better contrast against the actual background
+  for (let i = 1; i <= 100; i++) {
+    const L = A.lookOf(i / 100), other = L.theme === 'light' ? 'dark' : 'light';
+    assert.ok(A.contrast(I.palettes[L.theme].ink, L.rgb) >= A.contrast(I.palettes[other].ink, L.rgb), 'theme at ' + i / 100);
+  }
+}
+// The renderer without a browser: a canvas stub whose 2D context records what is drawn.
+function stubs() {
+  const log = { text: [], rects: 0, images: 0 }, st = { fillStyle: '' };
+  const ctx = new Proxy({}, {
+    get(t, k) {
+      if (k === 'fillText') return (ch) => log.text.push([ch, st.fillStyle]);
+      if (k === 'fillRect') return () => { log.rects++; };
+      if (k === 'drawImage') return () => { log.images++; };
+      return k === 'fillStyle' ? st.fillStyle : () => {};
+    },
+    set(t, k, v) { if (k === 'fillStyle') st.fillStyle = v; return true; },
+  });
+  const make = () => ({ width: 0, height: 0, getContext: () => ctx });
+  const canvas = Object.assign(make(), { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }), addEventListener() {} });
+  return { log, ctx, make, canvas };
+}
+{
+  const S = stubs(), rend = (tone) => { const L = A.lookOf(tone), r = new I.Renderer(S.canvas, { ...I.species.koi.defaults }); globalThis.document = { createElement: S.make }; r.setTheme(L.theme, L.palette); return r; };
+  globalThis.document = { createElement: S.make };
+  const r0 = rend(0), r1 = rend(1), r5 = rend(0.5);
+  assert.strictEqual(r0.cap, 1); // nothing is remapped on the dark background
+  assert.deepStrictEqual(r0.turn(255, 255, 255), [255, 255, 255]);
+  assert.deepStrictEqual(r0.turn(10, 200, 30), [10, 200, 30]);
+  // a light background: bright colours are darkened (hue kept) until they keep their contrast, dark ones stay as they are
+  for (const [r, tone] of [[r1, 1], [r5, 0.5]]) {
+    const bg = A.lookOf(tone).rgb;
+    for (const c of [[255, 255, 255], [244, 240, 230], [255, 200, 240], [236, 238, 242], [232, 56, 182], [200, 255, 220], [176, 70, 40]]) {
+      const t = r.turn(...c);
+      assert.ok(A.contrast(t, bg) >= I.CAP_CONTRAST * 0.9 || A.contrast(c, bg) >= I.CAP_CONTRAST * 0.9, 'visible on ' + tone + ': ' + c + ' -> ' + t);
+      assert.ok(t.every((v, i) => v <= c[i] + 1e-9), 'only darker');
+    }
+    assert.deepStrictEqual(r.turn(20, 20, 30), [20, 20, 30]);
+    const [tr, tg, tb] = r.turn(255, 200, 240); // hue kept: the channels keep their ratios
+    assert.ok(Math.abs(tr / tg - 255 / 200) < 1e-9 && Math.abs(tb / tg - 240 / 200) < 1e-9);
+  }
+}
+globalThis.document = undefined;
+
+// ---------- the animation engine, without a browser ----------
+// Every animal: the flock steps for a minute of simulated time, everything stays finite, and the creatures keep moving across the screen.
+for (const id of A.ANIMALS) {
+  const sp = I.species[id], tuning = { ...sp.defaults };
+  for (const extra of [{}, { corner: true }, { density: 4, speed: 3, size: 2.5 }, { density: 0.1, direction: 200 }]) {
+    const f = new I.Flock(sp, Object.assign({}, tuning, extra), undefined);
+    f.resize(1280, 720);
+    assert.ok(f.creatures.length > 0, id + ' has creatures');
+    const start = f.creatures.map((c) => [c.x, c.y]);
+    for (let i = 0; i < 3600; i++) f.step(1 / 60);
+    assert.ok(f.creatures.length > 0 && f.creatures.length <= (sp.max || 200));
+    for (const c of f.creatures) assert.ok(Number.isFinite(c.x) && Number.isFinite(c.y) && Number.isFinite(c.heading) && Number.isFinite(c.span) && c.span > 0, id + ' finite creature');
+    assert.ok(f.creatures.some((c, n) => start[n] && Math.hypot(c.x - start[n][0], c.y - start[n][1]) > 50), id + ' moves');
+  }
+  const f = new I.Flock(sp, tuning, undefined);
+  f.resize(1280, 720);
+  for (let i = 0; i < 120; i++) f.step(1 / 60);
+  f.startle(300, 300); // a click
+  for (let i = 0; i < 300; i++) f.step(1 / 60);
+  assert.ok(f.creatures.every((c) => Number.isFinite(c.x) && Number.isFinite(c.y)), id + ' after a click');
+}
+// The count follows the area and Density.
+{
+  const n = (d, w, h) => { const f = new I.Flock(I.species.koi, { ...I.species.koi.defaults, density: d }, undefined); f.resize(w, h); return f.creatures.length; };
+  assert.ok(n(4, 1280, 720) > n(1.6, 1280, 720) && n(1.6, 1280, 720) > n(0.2, 1280, 720));
+}
+// start(): the whole path (wrapper, renderer, frame loop) against stand-ins for window, document and the canvas. The stand-ins lack
+// ResizeObserver, IntersectionObserver, matchMedia and document.fonts, like Wallpaper Engine's browser can.
+function host(opts) {
+  const S = stubs(), listeners = {}, g = globalThis;
+  let cb = null, hidden = false, now = 0;
+  const win = { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} };
+  if (opts && opts.reduce) win.matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
+  const doc = { createElement: S.make, get hidden() { return hidden; }, addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, removeEventListener: (t, f) => { listeners[t] = (listeners[t] || []).filter((x) => x !== f); } };
+  const saved = {};
+  const put = (o) => { for (const k in o) { saved[k] = g[k]; g[k] = o[k]; } };
+  put({ window: win, document: doc, getComputedStyle: () => ({ fontFamily: '"Geist Mono"' }), performance: { now: () => now }, requestAnimationFrame: (f) => { cb = f; return 1; }, cancelAnimationFrame: () => { cb = null; } });
+  return Object.assign(S, {
+    frames(n, dt) { for (let i = 0; i < n; i++) { now += dt || 16.667; if (cb) { const f = cb; cb = null; f(now); } } },
+    scheduled: () => !!cb,
+    hide(v) { hidden = v; for (const f of listeners.visibilitychange || []) f(); },
+    done() { for (const k in saved) { if (saved[k] === undefined) delete g[k]; else g[k] = saved[k]; } },
+  });
+}
+for (const tone of [0, 0.5, 1]) for (const id of A.ANIMALS) {
+  const h = host();
+  try {
+    const e = A.start(h.canvas, { animal: id, background: tone });
+    h.frames(150);
+    assert.ok(h.log.images >= 150 && h.log.text.length > 100, id + ' ' + tone + ' draws glyphs'); // the canvas is not blank: background image + characters
+    assert.ok(h.log.text.every(([ch]) => typeof ch === 'string' && ch.length === 1));
+    e.destroy();
+  } finally { h.done(); }
+}
+{
+  const h = host();
+  try {
+    const e = A.start(h.canvas, { animal: 'koi' });
+    h.frames(10);
+    const t = e.app.tuning;
+    assert.strictEqual(t.speed, 1.6); // the animal's original defaults
+    // update: top-level keys, the animal changes, a value back to its default counts, other values stay
+    e.update({ tuning: { koi: { speed: 2, trail: 1 } } });
+    assert.strictEqual(e.app.tuning.speed, 2); assert.strictEqual(e.app.tuning.trail, 1);
+    e.update({ tuning: { koi: { speed: 2 } } });
+    assert.strictEqual(e.app.tuning.trail, 4, 'dropping a value restores the default');
+    e.update({ tuning: undefined });
+    assert.strictEqual(e.app.tuning.speed, 1.6);
+    e.update({ animal: 'crab', tuning: { crabs: { scare: 2 } } }); // an old id works
+    assert.strictEqual(e.app.animal.key, 'crabs'); assert.strictEqual(e.app.tuning.scare, 2); assert.strictEqual(e.app.tuning.density, 1.8);
+    e.update({ animal: 'koi', tuning: { crabs: { scare: 2 } } });
+    assert.strictEqual(e.app.animal.key, 'koi'); assert.strictEqual(e.app.tuning.speed, 1.6);
+    // the background: the renderer's palette follows
+    assert.strictEqual(e.app.renderer.palette, I.palettes.dark);
+    e.update({ background: 1 });
+    assert.deepStrictEqual(e.app.renderer.palette.background, [255, 255, 255]);
+    assert.strictEqual(e.app.renderer.theme, 'light');
+    e.update({ background: 0 });
+    assert.strictEqual(e.app.renderer.palette, I.palettes.dark);
+    assert.strictEqual(e.app.renderer.cap, 1);
+    h.frames(30);
+    // pause while hidden, resume when shown
+    h.hide(true); assert.ok(!h.scheduled(), 'no frames while hidden');
+    h.hide(false); assert.ok(h.scheduled(), 'frames again when shown');
+    e.destroy(); assert.ok(!h.scheduled());
+  } finally { h.done(); }
+}
+{ // the FPS limit: about fps frames a second (the rest are skipped, not drawn late); 0 = every frame
+  const count = (fps) => {
+    const h = host();
+    try { const e = A.start(h.canvas, { animal: 'frog' }); const n0 = h.log.images; if (fps !== undefined) e.setFps(fps); h.frames(120); e.destroy(); return h.log.images - n0; } finally { h.done(); }
+  };
+  assert.ok(count(undefined) >= 119);
+  const n = count(15); // 2 s of 60 fps frames
+  assert.ok(n >= 28 && n <= 32, 'limited to 15 fps: ' + n);
+  assert.ok(count(0) >= 119);
+}
+{ // reduced motion: one still frame, nothing scheduled
+  const h = host({ reduce: true });
+  try { const e = A.start(h.canvas, { animal: 'jellyfish' }); assert.ok(!h.scheduled()); assert.ok(h.log.images >= 1 && h.log.text.length > 50); e.destroy(); } finally { h.done(); }
 }
 
 // ---------- newtab.js pure helpers (the file exports them instead of touching the DOM when loaded by node) ----------
@@ -529,7 +397,7 @@ const { asUrl, greeting } = N;
 // (checked every 0.01, which includes 0, 0.25, 0.5, 0.75 and 1); the focus ring >= 3:1 against both
 {
   const nums = (v) => v.match(/[\d.]+/g).map(Number), v0 = N.uiVars(bgAt(0));
-  assert.deepStrictEqual(v0, { '--page': 'rgb(8,9,13)', '--ink': '255,255,255', '--shadow': '#000', '--panel': 'rgba(11,11,17,0.6)', '--sugg': 'rgba(11,11,17,0.88)',
+  assert.deepStrictEqual(v0, { '--page': 'rgb(6,7,12)', '--ink': '255,255,255', '--shadow': '#000', '--panel': 'rgba(11,11,17,0.6)', '--sugg': 'rgba(11,11,17,0.88)',
     '--fg': 'rgb(242,243,247)', '--strong': 'rgb(255,255,255)', '--opt': 'rgb(214,215,222)', '--dim': 'rgb(154,154,165)', '--mute': 'rgb(125,127,138)', '--hover': 'rgb(201,203,211)',
     '--ring': 'rgb(143,147,158)', '--listen': 'rgb(255,138,138)', '--disc1': 'rgb(141,140,144)', '--disc2': 'rgb(87,86,91)' });
   const over = (p, bg) => bg.map((c, i) => Math.round(p[3] * p[i] + (1 - p[3]) * c)); // the translucent panel over the background

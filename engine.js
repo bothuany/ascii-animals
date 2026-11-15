@@ -1,1064 +1,3125 @@
-// Shared ASCII-animals renderer. No host code: hosts call AsciiAnimals.start(canvas, settings).
-// Pure logic (normalize, fromWallpaperProps, countFor, createWorld, step, poke, raster) is importable in node.
+// ASCII Animals engine: the animation and drawing code, then a thin wrapper (settings schema, background tone,
+// start()). Classic script: hosts call AsciiAnimals.start(canvas, settings); node tests import it with require().
+// Lines marked "patch" differ from the code they were carried over from; everything else is unchanged.
 (function () {
-  'use strict';
-
-  const ANIMALS = ['butterfly', 'jellyfish', 'dragonfly', 'koi', 'frog', 'crane', 'crab'];
-  const ALIASES = { bird: 'crane' }; // old saved settings keep working
-  // The tweak set of the reference app's Tweaks panel: [key, label, group, min, max, step, default].
-  // Values are relative to each species' own look: at the defaults every species looks like the reference at its
-  // defaults (see LIVE below). `glass` applies to the new-tab search panel only.
-  const TWEAKS = [
-    ['density', 'Density', 'Movement', 0.1, 4, 0.05, 1.05],
-    ['corner', 'Corner to corner', 'Movement', 0, 1, 1, false],
-    ['direction', 'Direction (°)', 'Movement', 0, 360, 1, 49],
-    ['speed', 'Speed', 'Movement', 0.1, 3, 0.05, 1.05],
-    ['sway', 'Sway', 'Movement', 0, 0.6, 0.01, 0],
-    ['spread', 'Spread', 'Movement', 0, 0.8, 0.01, 0],
-    ['size', 'Size', 'Movement', 0.3, 2.5, 0.05, 1.25],
-    ['farthest', 'Farthest depth', 'Movement', 0.1, 1, 0.01, 0.18],
-    ['farBias', 'Far bias', 'Movement', 0.3, 3, 0.05, 1.7],
-    ['hold', 'Hold course', 'Movement', 0.2, 5, 0.05, 5],
-    ['separation', 'Separation', 'Movement', 0, 1000, 10, 700],
-    ['flutter', 'Flutter', 'Flight', 0, 3, 0.05, 0],
-    ['glide', 'Glide', 'Flight', 0, 4, 0.05, 2.75],
-    ['flapRate', 'Flap rate', 'Flight', 0.2, 3, 0.05, 1],
-    ['hue', 'Hue shift (°)', 'Look', -180, 180, 1, 0],
-    ['shimmer', 'Shimmer', 'Look', 0, 1, 0.01, 0.3],
-    ['sparkle', 'Sparkle', 'Look', 0, 0.5, 0.01, 0.12],
-    ['fade', 'Distance fade', 'Look', 0, 1, 0.01, 0.75],
-    ['trail', 'Trail', 'Look', 0, 4, 0.05, 1.55],
-    ['trailFade', 'Trail fade', 'Look', 0.05, 6, 0.05, 0.15],
-    ['grid', 'Grid', 'Look', 0, 4, 0.05, 1.05],
-    ['detail', 'ASCII detail', 'Look', 0.5, 2, 0.05, 1.3],
-    ['background', 'Background', 'Look', 0, 1, 0.01, 0], // 0 = the near-black background, 1 = white, in between neutral greys
-    ['blur', 'Blur (px)', 'Chat glass', 0, 30, 0.5, 3.5],
-    ['refraction', 'Refraction', 'Chat glass', 0, 150, 1, 40],
-    ['ripple', 'Ripple', 'Chat glass', 0.001, 0.04, 0.001, 0.007],
-    ['tint', 'Tint', 'Chat glass', 0, 3, 0.05, 0],
-    ['edge', 'Edge', 'Chat glass', 0, 2, 0.05, 0.55],
-    ['radius', 'Corner radius', 'Chat glass', 0, 48, 1, 24],
-    ['width', 'Width', 'Chat glass', 320, 960, 10, 720],
-  ].map(([key, label, group, min, max, step, def]) => ({ key, label, group, min, max, step, def }));
-  const DEFAULTS = { animal: 'butterfly', name: '' };
-  const LIMITS = {};
-  for (const t of TWEAKS) { DEFAULTS[t.key] = t.def; LIMITS[t.key] = [t.min, t.max]; }
-  const BG = '#08090d';
-  // Measured on the reference at 760, 1440 and 1920 px wide (ASCII detail 1.3): the whole scene scales with the window width.
-  // The grid is always 160 columns wide (cells 5 x 7, 9 x 13 and 12 x 17 px), cells are character-shaped (height 1.425 x width),
-  // and the animals keep the same size in cells and the same count. Shapes are designed in an isotropic unit (9 px at 1440, i.e.
-  // one cell, at Size 1.25) and rasterised onto that rectangular grid.
-  const COLS = 160, CELL_ASPECT = 12.4 / 8.7, UNIT = 9, REF_W = 1440, MIN_W = 320;
-  const MAX_ANIMALS = 120, MAX_LATERAL = Math.tan((10 * Math.PI) / 180); // spacing push / forward speed
-  const TAU = Math.PI * 2;
-  // The reference app's per-species defaults for the shared tweaks (its panel differs per species; size, speed and
-  // spacing differences are already in each species' own constants). A setting scales the species' value:
-  // eff = setting * live / default, or setting + (live - default) where either is 0 so no slider goes dead.
-  // n = individuals on screen with default settings, counted on the reference (about the same at every window size).
-  const LIVE = {
-    butterfly: { n: 16 },
-    koi: { n: 23, farthest: 0.33, farBias: 1.3, hold: 2.65, shimmer: 0.35, sparkle: 0.08, fade: 0.64, trail: 4, trailFade: 0.4 },
-    jellyfish: { n: 10, farthest: 0.3, farBias: 1.4, hold: 1.4, sway: 0.04, spread: 0.08, shimmer: 0, sparkle: 0.1, trail: 0.8, trailFade: 0.6 },
-    dragonfly: { n: 9, farthest: 0.32, farBias: 3, shimmer: 0, sparkle: 0.18, fade: 0.26, trail: 0.6, trailFade: 1.2 },
-    frog: { n: 13, farthest: 0.35, farBias: 1.4, shimmer: 0.15, sparkle: 0.05, fade: 0, trail: 3.45, trailFade: 0.4 },
-    crane: { n: 9, farthest: 0.35, farBias: 1.3, hold: 3, shimmer: 0.1, sparkle: 0.04, trail: 0, trailFade: 1.3, detail: 1.7 },
-    crab: { n: 21, farthest: 0.25, farBias: 0.7, hold: 3, shimmer: 0.1, sparkle: 0.03, fade: 0.12, trail: 1.2, trailFade: 0.35, detail: 1.7 },
-  };
-  // The effective value of tweak k for this species (clamped to the tweak's range).
-  function eff(s, animal, k) {
-    const live = LIVE[animal][k], d = DEFAULTS[k];
-    if (live === undefined) return s[k];
-    return clamp(d && live ? (s[k] * live) / d : s[k] + live - d, LIMITS[k][0], LIMITS[k][1]);
-  }
-  // Depth: five levels from near (s = 1) to Farthest depth; Far bias makes far ones more common; Distance fade dims
-  // them (colour mixed toward the background). k = speed factor.
-  function levelsFor(s, animal) {
-    const far = eff(s, animal, 'farthest'), bias = eff(s, animal, 'farBias'), fade = eff(s, animal, 'fade');
-    return [0, 1, 2, 3, 4].map((i) => {
-      const sc = 1 - ((1 - far) * i) / 4;
-      return { s: sc, k: 0.4 + 0.6 * sc, dim: fade * 0.64 * (i / 4), w: Math.max(0.05, 1 + ((bias - 1) * i) / 4) };
-    });
-  }
-
-  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  const wrapPi = (a) => { a %= TAU; return a > Math.PI ? a - TAU : a < -Math.PI ? a + TAU : a; };
-  const mod = (v, n) => ((v % n) + n) % n;
-  // Deterministic per-cell noise in [0,1).
-  function H(x, y, s) {
-    let h = (Math.imul(x + 101, 374761393) ^ Math.imul(y + 211, 668265263) ^ Math.imul((s || 0) + 7, 2246822519)) >>> 0;
-    h = Math.imul(h ^ (h >>> 13), 1274126177);
-    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-  }
-  // Smooth value noise in [0,1) for organic patches.
-  function vn(x, y, s) {
-    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
-    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
-    const a = H(ix, iy, s), b = H(ix + 1, iy, s), c = H(ix, iy + 1, s), d = H(ix + 1, iy + 1, s);
-    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
-  }
-  const hr = (x, y, s) => H(Math.round(x), Math.round(y), s); // hash of the body-local cell, so texture rides on the body
-  function segDist(x, y, x1, y1, x2, y2) {
-    const dx = x2 - x1, dy = y2 - y1, t = clamp(((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy), 0, 1);
-    return Math.hypot(x - x1 - dx * t, y - y1 - dy * t);
-  }
-
-  // ---------- settings ----------
-  function bool(v, d) {
-    if (typeof v === 'boolean') return v;
-    if (typeof v === 'number') return v !== 0;
-    if (typeof v === 'string') {
-      if (/^(false|0|no|off)$/i.test(v)) return false;
-      if (/^(true|1|yes|on)$/i.test(v)) return true;
-    }
-    return d;
-  }
-  const num = (v) => (v == null || typeof v === 'boolean' || (typeof v === 'string' && !v.trim()) ? NaN : Number(v));
-  // Accepts any input shape (WE values, query strings, storage) and returns a complete valid settings object.
-  function normalize(raw) {
-    const r = Object.assign({}, raw);
-    // settings saved by older versions: count 5-80 (25 = default swarm), character size 6-20 px, trail on/off
-    if (r.density === undefined && Number.isFinite(num(r.count))) r.density = (num(r.count) / 25) * DEFAULTS.density;
-    if (r.detail === undefined && num(r.size) >= 6 && num(r.size) <= 20) { r.detail = (DEFAULTS.detail * 10) / num(r.size); r.size = undefined; }
-    if (typeof r.trail === 'boolean' || /^(true|false|yes|no|on|off)$/i.test(r.trail)) r.trail = bool(r.trail, true) ? DEFAULTS.trail : 0;
-    let animal = String(r.animal == null ? DEFAULTS.animal : r.animal).toLowerCase();
-    animal = ALIASES[animal] || animal;
-    const out = {
-      animal: ANIMALS.includes(animal) ? animal : DEFAULTS.animal, // old 'random' and unknown values -> default
-      name: String(r.name == null ? '' : r.name).trim().slice(0, 40),
-    };
-    for (const t of TWEAKS) {
-      if (typeof t.def === 'boolean') { out[t.key] = bool(r[t.key], t.def); continue; }
-      const n = num(r[t.key]), v = clamp(Number.isFinite(n) ? n : t.def, t.min, t.max);
-      out[t.key] = +(Math.round(v / t.step) * t.step).toFixed(4); // snapped to the slider step
-    }
-    return out;
-  }
-  // Wallpaper Engine sends only changed properties as {key: {value}}; property keys are the tweak keys lowercased.
-  function fromWallpaperProps(props) {
-    const out = {};
-    for (const k of ['animal', ...TWEAKS.filter((t) => t.group !== 'Chat glass').map((t) => t.key)]) {
-      const p = props && props[k.toLowerCase()];
-      if (p && p.value !== undefined) out[k] = p.value;
-    }
-    return out;
-  }
-
-  // ---------- cells ----------
-  // A cell is one int: kind<<16 | colour<<8 | glyph. TILE = rounded tile with a glyph in a shade of its colour,
-  // HALO = very dim tile around a silhouette, BARE = glyph only (thin parts), EYE = white tile with a black pupil.
-  const TILE = 1, HALO = 2, BARE = 3, EYE = 4;
-  const enc = (k, c, g) => (k << 16) | (c << 8) | g;
-  const GL = ' .:-=+*%#8@0o|/\\{}()§~!•'; // index 0 = no glyph; '•' is drawn as a filled dot
-  const gs = (s) => Array.from(s, (c) => GL.indexOf(c));
-  const [DOT, OH, PERIOD] = gs('•o.');
-  const LINE = gs('-\\|/'); // screen angle 0, 45, 90, 135 degrees (y points down)
-  const pick = (set, h) => set[Math.floor(h * set.length) % set.length];
-  // The glyph that draws a line at screen angle th, so thin parts stay right while a body rotates.
-  const lineGlyph = (th) => LINE[Math.round(mod(th, Math.PI) / (Math.PI / 4)) % 4];
-  const ramp = (r, v) => r[0] + clamp(Math.round(v * (r[1] - 1)), 0, r[1] - 1);
-  function palette(groups) { // {name: [hex...]} -> {cols, name: [start, n]}
-    const out = { cols: [] };
-    for (const k in groups) { out[k] = [out.cols.length, groups[k].length]; out.cols.push(...groups[k]); }
-    return out;
-  }
-
-  // Each species: palette P (P.cols indexed by cells), box = local bounds in cells at full size (x forward along
-  // the heading, y to the right of it), cell(a, at) -> code where at = {x, y, tw, th} (tw = half a screen cell in local units,
-  // th = screen angle of the body), gait(a, dt, world) -> cells/s, prep(a) = per-frame animation values. Animation runs on
-  // a.at (advanced at Flap rate) and a.gl in [0, 1] (Glide: wings held, strokes relaxed).
-  const SPECIES = {};
-
-  // Butterfly: four rounded lobes in an X around the body (at 45 degrees they sit on the screen axes like a clover),
-  // lighter toward the lobe centres, dim indigo halo, two dashed antennae ending in 'o'.
-  {
-    const P = palette({
-      blue: ['#10284d', '#173c6c', '#22548c', '#3270aa', '#4489c8', '#58a0de', '#7db8ea', '#a9d0f1'],
-      halo: ['#4b567f'], body: ['#2a3350'], pale: ['#c4cad6'], ant: ['#aab1c0'], trail: ['#3a4a6a'],
-    });
-    // [angle from heading, centre distance, radial and tangential half-size, brightness lift]: forewings sweep
-    // forward-out, hindwings back-out (measured on t40: about +-68 and +-142 degrees)
-    const LOBES = [[1.19, 6, 5.1, 3.5, 0.06], [-1.19, 6, 5.1, 3.5, 0.06], [2.48, 5, 4.3, 3.1, 0], [-2.48, 5, 4.3, 3.1, 0]]
-      .map(([t, r, A, B, lift]) => ({ c: Math.cos(t), s: Math.sin(t), cx: r * Math.cos(t), cy: r * Math.sin(t), A, B, lift }));
-    const G = gs(':=+-:=.:+=*'), BODY = gs('8@#%'), HG = gs('#%@8:='), TIP = gs('0o');
-    SPECIES.butterfly = {
-      P, box: [-10, 12, -12.5, 12.5], space: 10, trailCol: P.trail[0],
-      gait: () => 7.5,
-      prep(a) { const f = 0.16 + 0.84 * Math.sqrt(0.5 + 0.5 * Math.cos(a.at * 9 + a.ph)); a.p0 = f + (0.92 - f) * a.gl; }, // gliding: wings held open
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw; const th = at.th;
-        const h = hr(x, y, a.seed);
-        if (Math.abs(y) < 0.62 && x > -3.8 && x < 2.4) return enc(TILE, P.body[0], pick(BODY, h));
-        const yy = y / a.p0;
-        let best = 1e9, lift = 0, inner = 0;
-        for (const L of LOBES) { // superellipse (exponent 3), compared cubed
-          const qx = x - L.cx, qy = yy - L.cy, ra = (qx * L.c + qy * L.s) / L.A, rt = Math.abs(-qx * L.s + qy * L.c) / L.B, ar = Math.abs(ra);
-          const r3 = ar * ar * ar + rt * rt * rt;
-          if (r3 < best) { best = r3; lift = L.lift; inner = Math.max(0, -ra); }
-        }
-        const r = best < 2.5 ? Math.cbrt(best) + (vn(x * 0.7, yy * 0.7, a.seed) - 0.5) * 0.1 : 9;
-        if (r <= 1) {
-          if (r > 0.72 && inner === 0 && h < 0.06) return enc(TILE, P.pale[0], pick(TIP, h * 16));
-          const v = 1.08 - r * 0.55 - inner * 0.3 + lift + (H(Math.round(x), Math.round(yy), a.seed + 1) - 0.5) * 0.16;
-          return enc(TILE, ramp(P.blue, v), pick(G, H(Math.round(x), Math.round(y), a.seed + 2)));
-        }
-        for (const sg of [-1, 1]) { // antennae: from the head, +-45 degrees, dashed, ending in 'o'
-          const ex = 2.6 + 6.4 * 0.71, ey = sg * 6.4 * 0.7;
-          if (Math.hypot(x - ex, y - ey) < tw * 0.8) return enc(BARE, P.ant[0], OH);
-          if (x > 2.8 && segDist(x, y, 2.6, 0, ex, ey) < tw && hr(x, y, a.seed + 3) > 0.12) return enc(BARE, P.ant[0], lineGlyph(th + sg * 0.78));
-        }
-        if (r < 1.25 && h < 0.8) return enc(HALO, P.halo[0], pick(HG, h));
-        return 0;
+  "use strict";
+var ts = Object.defineProperty;
+var es = (t, e, s) =>
+  e in t
+    ? ts(t, e, { enumerable: !0, configurable: !0, writable: !0, value: s })
+    : (t[e] = s);
+var S = (t, e, s) => es(t, typeof e != "symbol" ? e + "" : e, s);
+const B = Math.PI * 2,
+  R = (t, e, s) => (t < e ? e : t > s ? s : t),
+  F = (t, e) => t + Math.random() * (e - t),
+  Z = (t) => t - Math.floor(t),
+  nt = (t, e, s) => t + (e - t) * s;
+function ht(t, e, s) {
+  const i = R((s - t) / (e - t), 0, 1);
+  return i * i * (3 - 2 * i);
+}
+function dt(t, e) {
+  let s = (e - t) % B;
+  return s > Math.PI && (s -= B), s < -Math.PI && (s += B), s;
+}
+function W(t, e, s) {
+  let i =
+    Math.imul(t | 0, 374761393) ^
+    Math.imul(e | 0, 668265263) ^
+    Math.imul(s | 0, 1442695041);
+  return (
+    (i = Math.imul(i ^ (i >>> 13), 1274126177)),
+    (i ^= i >>> 16),
+    (i >>> 0) / 4294967296
+  );
+}
+const gt = {
+    density: 1,
+    corner: !1,
+    direction: 49,
+    speed: 1,
+    sway: 0.04,
+    spread: 0.06,
+    size: 1,
+    farthest: 0.45,
+    farBias: 1.6,
+    grip: 2,
+    separation: 300,
+    hueShift: 0,
+    shimmer: 0.3,
+    sparkle: 0.12,
+    fog: 0.75,
+    trail: 1,
+    trailFade: 1.3,
+    grid: 1.05,
+    detail: 1.3,
+  },
+  ue = {
+    movement: [
+      {
+        key: "density",
+        label: "Density",
+        min: 0.1,
+        max: 4,
+        step: 0.05,
+        hint: "How many are on screen.",
       },
-    };
-  }
-
-  // Jellyfish: magenta dome leading, pale rim of 'o' tiles, dotted halo, long fading tentacles of brace glyphs.
-  {
-    const P = palette({
-      mag: ['#2c0a28', '#3f1238', '#561d4c', '#6d2462', '#862c78', '#9e3a8d', '#b4579f'],
-      pale: ['#bb9ab4', '#d7c0d4'], dots: ['#6f6070'], tent: ['#cfc6d0', '#9a8f9c', '#62596a'], streak: ['#2e2a36'], trail: ['#4a3a4a'],
-    });
-    const G = gs(':.:=:.!'), TG = gs('{}()§-~|{}()§'), PG = gs('|:!');
-    SPECIES.jellyfish = {
-      P, box: [-34, 13.5, -12.5, 12.5], space: 9, trailCol: P.trail[0],
-      gait: (a) => 1.2 + 6 * (1 - a.gl) * Math.max(0, Math.sin(a.at * 2.6 + a.ph)) ** 2, // gliding: coasting between pulses
-      prep(a) { const c = (1 - a.gl) * Math.max(0, Math.sin(a.at * 2.6 + a.ph)); a.p0 = 1.08 + 0.14 * c; a.p1 = 1 - 0.14 * c; },
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw; const th = at.th;
-        x *= 0.78; y *= 0.78; tw *= 0.78; // the design below is in 0.78-scaled units: the largest reference bells are ~16 units wide
-        const ay = Math.abs(y), Rx = 5.4 * a.p0, Ry = 6.2 * a.p1, h = hr(x, y, a.seed);
-        if (x > -0.9) {
-          const r = Math.pow(Math.pow(Math.max(0, x) / Rx, 2.4) + Math.pow(ay / Ry, 2.4), 1 / 2.4) + (vn(x * 0.8, y * 0.8, a.seed) - 0.5) * 0.12;
-          if (r <= 1) {
-            if (x < 0.6) return h < 0.55 ? enc(TILE, P.pale[0], OH) : enc(TILE, ramp(P.mag, 0.5 + h * 0.3), pick(G, h));
-            if (h < 0.13) return enc(TILE, P.pale[h < 0.04 ? 1 : 0], pick(PG, h * 8));
-            const v = 0.3 + 0.35 * (x / Rx) + (r > 0.82 ? 0.3 : 0) + (H(Math.round(x), Math.round(y), a.seed + 1) - 0.5) * 0.35;
-            return enc(TILE, ramp(P.mag, v), pick(G, H(Math.round(x), Math.round(y), a.seed + 2)));
-          }
-          if (r < 1.45 && h < 0.8) return enc(BARE, P.dots[0], PERIOD);
-          if (x >= 0) return 0;
-        }
-        if (x > -24) {
-          const k = -x / 24, taper = 1 - k * 0.35;
-          for (let i = 0; i < 6; i++) {
-            const ty = (i - 2.5) * 1.5 * taper + Math.sin(x * 0.42 + a.at * 2.2 + i * 1.3) * 0.8;
-            if (Math.abs(y - ty) < tw * 1.15) {
-              const hh = H(Math.round(x * 2), i, a.seed + Math.floor(a.at * 1.5));
-              if (hh < k * 0.55 + 0.05) return 0;
-              return enc(BARE, P.tent[k < 0.4 ? 0 : k < 0.7 ? 1 : 2], pick(TG, hh));
-            }
-          }
-          if (ay > 4.4 * taper && ay < 6.6 && x < -1.5 && x > -15 && h < 0.3) return enc(BARE, P.streak[0], lineGlyph(th));
-        }
-        return 0;
+      {
+        key: "corner",
+        label: "Corner to corner",
+        toggle: !0,
+        hint: "Cross from the bottom-left corner to the top-right, whatever the window's shape. Turn off to set Direction yourself.",
       },
-    };
-  }
-
-  // Dragonfly: green tile thorax with two eye tiles, wings of bare glyphs spread sideways, a long abdomen of
-  // single spaced tiles trailing behind and fading, small red wing spots.
-  {
-    const P = palette({
-      green: ['#123322', '#1d4430', '#2a5c42', '#3a7a58', '#4ea57f', '#6fcf9b', '#9aeec2'],
-      grey: ['#56625c'], wing: ['#dde2e4', '#9aa2a6'], red: ['#c9445a'], trail: ['#2c4436'],
-    });
-    const TG = gs('8#=%:8'), WG = gs('.:+.:'), AG = gs('=:-');
-    const WINGS = [[2.2, 12, 2.1], [-1.4, 11, 1.9]];
-    SPECIES.dragonfly = {
-      P, box: [-24, 8.5, -14, 14], space: 11, trailCol: P.trail[0],
-      gait: (a) => 9 + Math.sin(a.at * 0.9 + a.ph) * 1.5,
-      prep(a) { a.p0 = Math.floor(a.at * 14); a.p1 = Math.sin(a.at * 40 + a.ph) * 0.35 * (1 - a.gl); },
-      eye: enc(EYE, 0, 0), eyes(a, E) { E[0] = 5.2; E[1] = 1; E[2] = 5.2; E[3] = -1; },
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw; const th = at.th;
-        const ay = Math.abs(y), h = hr(x, y, a.seed);
-        if (x > -2.6 && x < 4.8 && ay < 1.9 - Math.max(0, x - 3) * 0.5) {
-          return enc(TILE, ramp(P.green, 0.6 + (x > 1 ? 0.2 : 0) - ay * 0.15 + (h - 0.5) * 0.5), pick(TG, h * 3 % 1));
-        }
-        if (x <= -2.6 && x > -22 && ay < tw) {
-          const k = (-2.6 - x) / 19.4;
-          if (h < 0.1 + k * 0.25) return 0;
-          return enc(TILE, h > 0.86 ? P.grey[0] : ramp(P.green, 0.72 - k * 0.6 + (h - 0.5) * 0.35), pick(AG, h * 7 % 1));
-        }
-        for (const [bx, span, hc] of WINGS) {
-          const xc = bx - ay * 0.1 + a.p1 * (ay / span);
-          if (ay > 1.8 && ay < span && Math.abs(x - xc) < hc * (1 - (ay / span) ** 4)) {
-            if (bx > 0 && Math.abs(ay - span + 1.2) < tw && Math.abs(x - xc) < tw && (a.seed & 1)) return enc(TILE, P.red[0], 0);
-            const q = H(Math.round(x), Math.round(y), a.seed + (H(Math.round(x), Math.round(y), 9) < 0.3 ? a.p0 : 0));
-            if (q < 0.14) return 0;
-            if (q < 0.62) return enc(BARE, P.wing[0], lineGlyph(th + Math.PI / 2));
-            return enc(BARE, P.wing[q < 0.85 ? 0 : 1], pick(WG, q));
-          }
-        }
-        return 0;
+      {
+        key: "direction",
+        label: "Direction (°)",
+        min: 0,
+        max: 360,
+        step: 1,
+        disabledWhen: "corner",
+        hint: "Which way they travel, in degrees: 0 is right, 90 is up. Only used when Corner to corner is off.",
       },
-    };
-  }
-
-  // Koi: an articulated spine (see spine code below) supplies x = distance from the snout, y = lateral offset.
-  // Seen from above, as on the reference: blunt rounded head, torpedo body widest in the first third and full for most of
-  // its length, a short slim stalk, a V-shaped tail fan of grey / \ tiles, pectoral fins sticking out sideways and two
-  // white eye dots on the head. Varieties: kohaku (mostly white with red blotches), orange, gold, red.
-  {
-    const P = palette({
-      white: ['#706f69', '#a09f98', '#c4c3b9', '#dedfd2', '#e8e8dc'],
-      red: ['#5c130e', '#7e1f15', '#9e2c20', '#b93f31', '#d04c3c'],
-      orange: ['#42200c', '#68361a', '#96511f', '#c06830', '#d87c34', '#f0903c'],
-      gold: ['#3a2e12', '#5a4518', '#7e6020', '#a07c28', '#b89034', '#c9a042'],
-      fin: ['#4a4a4c', '#5e5e60', '#767678'], eye: ['#f2f2f2'], dot: ['#77716c'], food: ['#cdb47a'], trail: ['#3a3634'],
-    });
-    // The shape is drawn at the size of the reference's nearest koi in a 760x1000 window (~30 long with the fan, ~7 wide) and scaled by K.
-    // Measured on the reference: its nearest koi are ~21 long in 760x460 and 1440x870 and ~30 in 760x1000, so its animals do not scale with
-    // the width alone; K matches the wide windows (ours scales with the width only, so in a tall window ours stay ~21).
-    const K = 0.72, LB = 25, WM = 3.7, SW = 1.25; // body length to the tail root, body and stalk half-width
-    const width = (s) => {
-      const x = s * LB;
-      if (x < 4.6) return WM * Math.sqrt(Math.max(0, 1 - (1 - (x + 0.2) / 4.8) ** 2)); // rounded head
-      if (s < 0.66) return WM;
-      return s > 0.8 ? SW : SW + (WM - SW) * 0.5 * (1 + Math.cos((Math.PI * (s - 0.66)) / 0.14));
-    };
-    const FG = gs('=-='), TG = gs('/\\/\\|'), DENSE = gs('%#*+=-:.'); // body glyphs follow tile brightness: denser on darker tiles, as on the reference
-    const LUM = P.cols.map((c) => (0.3 * parseInt(c.slice(1, 3), 16) + 0.59 * parseInt(c.slice(3, 5), 16) + 0.11 * parseInt(c.slice(5), 16)) / 255);
-    SPECIES.koi = {
-      P, spine: true, len: LB * K, tail: 8.7 * K, pad: 7 * K, width: WM * K, reach: 28, space: 8, trailCol: P.trail[0], seg: 7,
-      glyph: (c) => { // grey tiles get light glyphs, coloured and white ones darker shades (each channel pulled down, so reds stay saturated)
-        const mx = Math.max(c[0], c[1], c[2]);
-        return mx - Math.min(c[0], c[1], c[2]) < 30 && mx < 140 ? c.map((v) => Math.min(255, v + 100)) : c.map((v) => Math.max(0, v - 60));
+      {
+        key: "speed",
+        label: "Speed",
+        min: 0.1,
+        max: 3,
+        step: 0.05,
+        hint: "How fast they travel.",
       },
-      pals: [3, 1.3, 0.5, 0.6], // kohaku, orange, gold, red: relative frequency (gold is rare on the reference)
-      gait: (a) => (a.eating ? 6.5 : 3.6),
-      eye: enc(BARE, P.eye[0], DOT), eyes(a, E) { E[0] = 2 * K; E[1] = 1.2 * K; E[2] = 2 * K; E[3] = -1.2 * K; },
-      prep(a) { a.p0 = a.at * (a.eating ? 9 : 5.5) + a.ph; a.p1 = (a.eating ? 0.7 : 0.45) * (1 - 0.6 * a.gl); },
-      cell(a, at) {
-        let x = at.x / K, y = at.y / K; const tw = at.tw / K;
-        const s = x / LB;
-        y -= a.p1 * Math.max(0, s) ** 2 * Math.sin(a.p0 - x * 0.45); // tail sway
-        const ay = Math.abs(y), w = width(s), h = hr(x, y, a.seed);
-        if (s >= 0 && s <= 1 && ay <= w) {
-          const lat = y / Math.max(w, 0.6);
-          let v = 0.86 - (a.pal ? 0.5 : 0.3) * Math.max(0, lat) + 0.12 * Math.max(0, -lat) - 0.25 * Math.max(0, (s - 0.55) / 0.45) + (h - 0.5) * 0.16;
-          if (ay > w - 0.7) v -= 0.08;
-          const n = vn(x * 0.34 + a.seed * 0.37, y * 0.55 + a.seed * 0.11, a.seed);
-          let r;
-          if (a.pal === 0) r = n > 0.64 || (a.cap && x < 3.5) ? P.red : P.white;
-          else if (a.pal === 1) { r = P.orange; if (n > 0.66) v -= 0.3; }
-          else if (a.pal === 2) { r = P.gold; if (n > 0.68) v -= 0.25; }
-          else r = n > 0.72 ? P.white : P.red;
-          const c = ramp(r, v), f = 7.3 * LUM[c] * (1 - 0.1 * a.lvl) + 0.17 + (H(Math.round(x), Math.round(y), a.seed + 2) - 0.5) * 1.8; // a.lvl: farther tiles are drawn dimmer
-          return enc(TILE, c, DENSE[Math.round(clamp(f, 0, 7))]);
-        }
-        const q = ay - w, t = x - 0.27 * LB;
-        if (q > 0 && q < 2 && t > q * 0.8 - 0.4 && t < 1.8 + q * 0.8) return enc(TILE, ramp(P.fin, 0.3 + h * 0.6), pick(FG, h)); // pectoral fins
-        const e = x - LB;
-        if (e > 0 && e < 6 && Math.abs(ay - e) < 1.25 && e + ay < 7.9) return enc(TILE, ramp(P.fin, 0.3 + h * 0.6), pick(TG, h * 7 % 1)); // tail fan: two thick arms at 45 degrees from the root
-        if (e >= 6 && e < 8.7 && ay < 2 && h > 0.8) return enc(BARE, P.dot[0], PERIOD);
-        return 0;
+      {
+        key: "sway",
+        label: "Sway",
+        min: 0,
+        max: 0.6,
+        step: 0.01,
+        hint: "How much the whole group slowly drifts left and right off course. 0 is a dead-straight line.",
       },
-    };
-  }
-
-  // Frog: a squat green blob seen from above with eye tiles at the front corners, folded hind legs, glyph toes.
-  // It hops: body stretches and the hind legs kick out behind during a leap.
-  {
-    const P = palette({
-      green: ['#0f300a', '#1c4518', '#285a22', '#346b29', '#417d31', '#4e923b', '#5fa548'],
-      olive: ['#5e7346', '#77905a', '#94ad74', '#b5d39b'], toe: ['#9aa59a'], trail: ['#26381f'],
-    });
-    const G = gs('*%#:.@=+:*'), TOE = gs('/|-.');
-    SPECIES.frog = {
-      P, box: [-15, 9, -8, 8], space: 7, trailCol: P.trail[0], mode0: 'rest',
-      gait(a, dt, world) {
-        a.timer -= dt;
-        if (a.mode === 'rest') {
-          if (a.timer <= 0 || a.flee > 0) { a.mode = 'leap'; a.timer = 0.5; }
-          return 0;
-        }
-        if (a.timer <= 0) { a.mode = 'rest'; a.timer = (0.6 + a.rnd() * 1.8) * world.pause; return 0; }
-        return 24 * (a.timer / 0.5) ** 1.5;
+      {
+        key: "spread",
+        label: "Spread",
+        min: 0,
+        max: 0.8,
+        step: 0.01,
+        hint: "How far each one's own path can stray from the group's. 0 means everyone keeps exactly the same line.",
       },
-      eye: enc(EYE, 0, 0), eyes(a, E) { const L = a.p0; E[0] = E[2] = 3.5 + L * 1.6; E[1] = 2.5 - L * 0.5; E[3] = -E[1]; },
-      prep(a) { a.p0 = a.mode === 'leap' ? Math.sin(Math.PI * clamp(1 - a.timer / 0.5, 0, 1)) : 0; },
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw;
-        const L = a.p0, ay = Math.abs(y), h = hr(x, y, a.seed);
-        const bx = x / (1 + 0.3 * L), by = y / (1 - 0.15 * L);
-        const r = Math.hypot(bx / 4.9, by / (4.3 - Math.max(0, bx) * 0.28)) + (vn(x * 0.6 + 3, y * 0.6, a.seed) - 0.5) * 0.3;
-        const tile = (v) => {
-          const n = vn(x * 0.45, y * 0.45, a.seed + 5);
-          return n > 0.6 ? enc(TILE, ramp(P.olive, v + (h - 0.5) * 0.4), pick(G, h)) : enc(TILE, ramp(P.green, v + (h - 0.5) * 0.45), pick(G, h));
-        };
-        if (r <= 1) return tile(0.6 + (ay < 2 && x < 1.5 ? 0.15 : 0) - (r > 0.8 ? 0.2 : 0));
-        // hind legs: folded at the back sides while resting, kicked out behind in a leap
-        const hx1 = -2.6 - L * 1.5, hy1 = 3.3 - L * 1.2, hx2 = -3.8 - L * 8, hy2 = 4.6 - L * 1.6;
-        if (segDist(x, ay, hx1, hy1, hx2, hy2) < 1.05 - L * 0.35) return tile(0.35);
-        const fx = L ? hx2 - 1 : -1.6, fy = L ? hy2 + 0.6 : 5.6;
-        if (segDist(x, ay, hx2, hy2, fx, fy) < tw * 1.2) return tile(0.3);
-        if (segDist(x, ay, 2.4 + L * 1.5, 3.2 - L, 3.1 + L * 2.5, 4.4 - L) < 0.7) return tile(0.3); // front legs
-        if (h < 0.55 && (Math.hypot(x - (3.9 + L * 2.5), ay - (5.1 - L)) < 1.1 || Math.hypot(x - fx + 0.4, ay - fy - 0.6) < 1.1)) {
-          return enc(BARE, P.toe[0], pick(TOE, h * 1.8));
-        }
-        return 0;
+      {
+        key: "size",
+        label: "Size",
+        min: 0.3,
+        max: 2.5,
+        step: 0.05,
+        hint: "How big they are.",
       },
-    };
-  }
-
-  // Crane: white mosaic seen from above in flight - long swept wings across the body (an X at 45 degrees),
-  // darker trailing edges and tips, thin neck of small grey cells to a red crown with white eye dots, glyph beak and legs.
-  {
-    const P = palette({
-      white: ['#323238', '#4a4a51', '#616168', '#8a8991', '#b0b0b7', '#cdcdd4', '#e1e1e8', '#f3f3f7'],
-      crown: ['#d8285a'], eye: ['#f4f4f4'], beak: ['#9a9aa3'], leg: ['#5c5c64'], trail: ['#34343a'],
-    });
-    const G = gs(':-:=.:+:');
-    SPECIES.crane = {
-      P, box: [-17, 15, -16.5, 16.5], space: 13, trailCol: P.trail[0],
-      gait: () => 10,
-      eye: enc(BARE, P.eye[0], DOT), eyes(a, E) { E[0] = 10.6; E[1] = 1; E[2] = 10.6; E[3] = -1; },
-      prep(a) { const b = (1 - a.gl) * Math.sin(a.at * 3.2 + a.ph); a.p0 = 0.86 + 0.14 * b + 0.12 * a.gl; a.p1 = 0.5 * b; },
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw; const th = at.th;
-        const ay = Math.abs(y), h = hr(x, y, a.seed);
-        if (Math.abs(x - 11.2) < tw && ay < tw) return enc(TILE, P.crown[0], 0);
-        if (x > 11.7 && x < 14.6 && ay < tw && h > 0.25) return enc(BARE, P.beak[0], lineGlyph(th));
-        if (x > 5 && x < 10.8 && ay < tw) return enc(TILE, ramp(P.white, 0.3 + h * 0.3), pick(G, h));
-        const span = 15 * a.p0, xc = 0.4 - ay * 0.2 + (a.p1 * ay) / 12, hc = 2.6 - (ay / span) * 1.3;
-        if (ay < span && Math.abs(x - xc) < hc * (ay > span - 1.5 ? 0.8 : 1)) {
-          let v = 0.9 + (h - 0.5) * 0.2;
-          if (x - xc < -hc + 1.1) v = 0.4 + h * 0.15; // darker trailing edge
-          if (ay > span - 3) v -= 0.4;
-          return enc(TILE, ramp(P.white, v), pick(G, H(Math.round(x), Math.round(y), a.seed + 1)));
-        }
-        const hw = x > 0 ? 1.8 - x * 0.24 : 2.1 - (-x / 9.5) * 0.7;
-        if (x > -9.5 && x < 5 && ay < hw) return enc(TILE, ramp(P.white, 0.82 - (x < -5.5 || ay > hw - 0.8 ? 0.3 : 0) + (h - 0.5) * 0.25), pick(G, h));
-        if (x < -9.5 && x > -16 && Math.abs(ay - 0.6) < tw && h < 0.85 + (x + 9.5) * 0.08) return enc(BARE, P.leg[0], lineGlyph(th));
-        return 0;
+      {
+        key: "farthest",
+        label: "Farthest depth",
+        min: 0.1,
+        max: 1,
+        step: 0.01,
+        hint: "How small and faint the farthest ones get. 1 makes them all equally close.",
       },
-    };
-  }
-
-  // Crab: rounded red shell lighter in the middle, front (with white eyes and hooked claws) facing the left of its
-  // travel so it scuttles sideways up-right; dim glyph legs.
-  {
-    const P = palette({
-      red: ['#4a0f0a', '#671d14', '#813128', '#9c4138', '#b04f46', '#c8604f', '#d8806a', '#e8a084'],
-      eye: ['#f4f4f4'], leg: ['#7a4440'], trail: ['#3a2422'],
-    });
-    const G = gs('%#=:+.%=');
-    SPECIES.crab = {
-      P, box: [-9, 9, -8.5, 6.5], space: 6.5, trailCol: P.trail[0], mode0: 'go',
-      gait(a, dt, world) {
-        a.timer -= dt;
-        if (a.timer <= 0) { a.mode = a.mode === 'go' ? 'stop' : 'go'; a.timer = a.mode === 'go' ? 0.5 + a.rnd() * 0.9 : (0.25 + a.rnd() * 0.6) * world.pause; }
-        a.v0 = (a.v0 || 0) + (((a.mode === 'go' || a.flee > 0) ? 7.5 : 0) - (a.v0 || 0)) * Math.min(1, dt * 10);
-        return a.v0;
+      {
+        key: "farBias",
+        label: "Far bias",
+        min: 0.3,
+        max: 3,
+        step: 0.05,
+        hint: "How many sit far away versus close. Higher puts more of them in the distance.",
       },
-      prep(a) { a.p0 = a.mode === 'go' ? Math.sin(a.at * 22) : 0; },
-      eye: enc(BARE, P.eye[0], DOT), eyes(a, E) { E[0] = 1.1; E[1] = -3.7; E[2] = -1.1; E[3] = -3.7; },
-      cell(a, at) {
-        let x = at.x, y = at.y, tw = at.tw; const th = at.th;
-        const ax = Math.abs(x), h = hr(x, y, a.seed), sg = x < 0 ? -1 : 1;
-        const r = Math.pow(Math.pow(ax / 4, 2.3) + Math.pow(Math.abs(y - 0.4) / 3.4, 2.3), 1 / 2.3) + (vn(x * 0.7, y * 0.7, a.seed) - 0.5) * 0.18;
-        if (r <= 1) return enc(TILE, ramp(P.red, 1.02 - r * 0.62 + (h - 0.5) * 0.3), pick(G, h));
-        if (segDist(ax, y, 2.4, -2.4, 3.3, -4.4) < 0.62) return enc(TILE, ramp(P.red, 0.45 + h * 0.2), pick(G, h));
-        const cx = ax - 3.7, cy = y + 5.6, cr = Math.hypot(cx, cy), ang = Math.atan2(cy, -cx);
-        if (Math.abs(cr - 1.2) < 0.62 && !(ang > -0.2 && ang < 1.3)) return enc(TILE, ramp(P.red, 0.55 + h * 0.25), pick(G, h));
-        for (let i = 0; i < 4; i++) { // legs reach out sideways (along the travel), so they read as '/' on screen
-          const y1 = -1 + i * 1.2, w = a.p0 * (i & 1 ? 0.4 : -0.4);
-          if (segDist(ax, y, 3.8, y1, 6.6, y1 + 0.5 + w) < tw && h < 0.85) return enc(BARE, P.leg[0], lineGlyph(th + sg * Math.atan2(0.5 + w, 2.8)));
-        }
-        return 0;
+      {
+        key: "grip",
+        label: "Hold course",
+        min: 0.2,
+        max: 5,
+        step: 0.05,
+        hint: "How hard they steer back onto course after drifting. Higher is stricter.",
       },
-    };
+      {
+        key: "separation",
+        label: "Separation",
+        min: 0,
+        max: 1e3,
+        step: 10,
+        hint: "How strongly neighbours keep their distance from each other.",
+      },
+    ],
+    look: [
+      {
+        key: "hueShift",
+        label: "Hue shift (°)",
+        min: -180,
+        max: 180,
+        step: 1,
+        hint: "Turns the animal's colour around the colour wheel, in degrees. Find one you like and tell me the number to make it permanent.",
+      },
+      {
+        key: "shimmer",
+        label: "Shimmer",
+        min: 0,
+        max: 1,
+        step: 0.01,
+        hint: "How much iridescent surfaces roll brighter and darker as the animal turns.",
+      },
+      {
+        key: "sparkle",
+        label: "Sparkle",
+        min: 0,
+        max: 0.5,
+        step: 0.01,
+        hint: "How often cells flash white, like light catching scales or wings.",
+      },
+      {
+        key: "fog",
+        label: "Distance fade",
+        min: 0,
+        max: 1,
+        step: 0.01,
+        hint: "How much far-away ones fade into the background.",
+      },
+      {
+        key: "trail",
+        label: "Trail",
+        min: 0,
+        max: 4,
+        step: 0.05,
+        hint: "How much they leave behind: scales, ripples, footprints or glow.",
+      },
+      {
+        key: "trailFade",
+        label: "Trail fade",
+        min: 0.05,
+        max: 6,
+        step: 0.05,
+        hint: "How quickly that trail fades. Lower lingers longer.",
+      },
+      {
+        key: "grid",
+        label: "Grid",
+        min: 0,
+        max: 4,
+        step: 0.05,
+        hint: "How visible the background grid lines are.",
+      },
+      {
+        key: "detail",
+        label: "ASCII detail",
+        min: 0.5,
+        max: 2,
+        step: 0.05,
+        hint: "ASCII resolution. Higher means smaller characters and finer animals.",
+      },
+    ],
+  },
+  pe = 240,
+  is = 160;
+class ge {
+  constructor(e, s, i) {
+    S(this, "width", 0);
+    S(this, "height", 0);
+    S(this, "time", 0);
+    S(this, "creatures", []);
+    S(this, "events", []);
+    S(this, "base", 120);
+    S(this, "acc", { x: 0, y: 0 });
+    S(this, "nextId", 1);
+    (this.animal = e), (this.tuning = s), (this.count = i);
   }
-
-  for (const id of ANIMALS) {
-    const sp = SPECIES[id];
-    if (!sp.spine) { const [x0, x1, y0, y1] = sp.box; sp.reach = Math.max(Math.hypot(x0, y0), Math.hypot(x0, y1), Math.hypot(x1, y0), Math.hypot(x1, y1)); }
+  resize(e, s) {
+    const i = this.width === 0;
+    (this.width = e),
+      (this.height = s),
+      (this.base = R(Math.min(e, s) * 0.2, 80, 190) * this.animal.scale),
+      i && this.populate(!0);
   }
-
-  // ---------- rasteriser ----------
-  // Writes the screen-grid cells (gx, gy, code) of one animal into BUF and returns how many. Pure: node can call it.
-  const BUF = { n: 0, x: new Int32Array(2048), y: new Int32Array(2048), c: new Int32Array(2048) };
-  function push(gx, gy, code) {
-    if (BUF.n === BUF.x.length) {
-      for (const k of ['x', 'y', 'c']) { const b = new Int32Array(BUF.n * 2); b.set(BUF[k]); BUF[k] = b; }
-    }
-    BUF.x[BUF.n] = gx; BUF.y[BUF.n] = gy; BUF.c[BUF.n++] = code;
+  get course() {
+    const e = this.tuning;
+    return e.corner
+      ? Math.atan2(-this.height, this.width)
+      : (-e.direction * Math.PI) / 180;
   }
-
-  // Koi spine: a follow-the-leader chain from the snout (point 0) back; each frame the points are pulled behind
-  // the head at a fixed segment length, so turning bends the body like a real fish.
-  function initSpine(a, sp, u, world) {
-    const n = sp.seg + 1, seg = (sp.len * u * world.levels[a.lvl].s) / sp.seg;
-    a.spine = new Float64Array(n * 2); a.spineU = u;
-    let x = a.x, y = a.y;
-    for (let j = 0; j < n; j++) { a.spine[2 * j] = x; a.spine[2 * j + 1] = y; x -= Math.cos(a.dir) * seg; y -= Math.sin(a.dir) * seg; }
+  get heading() {
+    const e = this.time;
+    return (
+      this.course +
+      this.tuning.sway * (Math.sin(e * 0.13) + 0.5 * Math.sin(e * 0.31 + 1.7))
+    );
   }
-  function followSpine(a, sp, u, world) {
-    if (!a.spine || a.spineU !== u) { initSpine(a, sp, u, world); return; }
-    const p = a.spine, n = p.length / 2, seg = (sp.len * u * world.levels[a.lvl].s) / sp.seg;
-    p[0] = a.x; p[1] = a.y;
-    for (let j = 1; j < n; j++) {
-      const dx = p[2 * j] - p[2 * j - 2], dy = p[2 * j + 1] - p[2 * j - 1], d = Math.hypot(dx, dy) || 1;
-      p[2 * j] = p[2 * j - 2] + (dx / d) * seg; p[2 * j + 1] = p[2 * j - 1] + (dy / d) * seg;
-    }
+  get target() {
+    const { width: e, height: s, animal: i } = this,
+      n = (this.base / i.scale / is) ** 2;
+    return (
+      this.count ??
+      R(
+        Math.round(((e * s) / (i.area * n)) * this.tuning.density),
+        1,
+        i.max ?? 200,
+      )
+    );
   }
-
-  // Eyes are placed after the body, one screen cell each (a local box test flickers between 0, 1 and 2 cells as the animal moves).
-  // (c, s) = rotation of local axes on screen, m = screen px per local unit, o = screen position of the local origin.
-  const EYES = new Float64Array(4);
-  function putEyes(sp, a, ox, oy, c, s, m, cw, ch) {
-    if (!sp.eyes) return;
-    sp.eyes(a, EYES);
-    let x0 = 0, y0 = 0, g0x = 0, g0y = 0;
-    for (let i = 0; i < 2; i++) {
-      const lx = EYES[2 * i], ly = EYES[2 * i + 1], sx = (lx * c - ly * s) * m, sy = (lx * s + ly * c) * m;
-      let gx = Math.floor((ox + sx) / cw), gy = Math.floor((oy + sy) / ch);
-      if (i && gx === g0x && gy === g0y) { // second eye on the first one's cell: step one cell away from it
-        if (Math.abs(sx - x0) >= Math.abs(sy - y0)) gx += sx < x0 ? -1 : 1; else gy += sy < y0 ? -1 : 1;
-      }
-      x0 = sx; y0 = sy; g0x = gx; g0y = gy;
-      let j = BUF.n - 1;
-      while (j >= 0 && (BUF.x[j] !== gx || BUF.y[j] !== gy)) j--;
-      if (j >= 0) BUF.c[j] = sp.eye; else push(gx, gy, sp.eye);
-    }
+  depthOf(e) {
+    const s = this.tuning;
+    return s.farthest + (1 - s.farthest) * Math.pow(e, s.farBias);
   }
-
-  function raster(world, a) {
-    BUF.n = 0;
-    const sp = SPECIES[world.animal], u = world.u, cw = world.cw, ch = world.ch, sc = world.levels[a.lvl].s;
-    const tw = (0.5 * Math.sqrt(cw * ch)) / (u * sc); // half a screen cell, in local units
-    Q.tw = tw; Q.th = a.dir;
-    if (sp.prep) sp.prep(a);
-    if (sp.spine) {
-      if (!a.spine || a.spineU !== u) initSpine(a, sp, u, world);
-      const p = a.spine, n = p.length / 2, seg = (sp.len * u * sc) / sp.seg, k = 1 / (u * sc), R = sp.pad * u * sc; // widest reach from the spine: fins
-      const U = SEGS.u, TH = SEGS.th;
-      for (let j = 0; j < n - 1; j++) {
-        U[2 * j] = (p[2 * j + 2] - p[2 * j]) / seg; U[2 * j + 1] = (p[2 * j + 3] - p[2 * j + 1]) / seg;
-        TH[j] = Math.atan2(-U[2 * j + 1], -U[2 * j]);
-      }
-      // the tail fan and its dots run past the last spine point
-      const ex = p[2 * n - 2] + U[2 * n - 4] * sp.tail * u * sc, ey = p[2 * n - 1] + U[2 * n - 3] * sp.tail * u * sc;
-      let y0 = Math.min(ey, p[1]), y1 = Math.max(ey, p[1]);
-      for (let j = 0; j < n; j++) { y0 = Math.min(y0, p[2 * j + 1]); y1 = Math.max(y1, p[2 * j + 1]); }
-      for (let gy = Math.floor((y0 - R) / ch); gy <= Math.floor((y1 + R) / ch); gy++) {
-        const py = (gy + 0.5) * ch;
-        let lo = 1e9, hi = -1e9; // this row's x-span: union of the segments' boxes grown by R
-        for (let j = 0; j < n; j++) {
-          const ax = p[2 * j], ay = p[2 * j + 1], bx = j < n - 1 ? p[2 * j + 2] : ex, by = j < n - 1 ? p[2 * j + 3] : ey;
-          if (py < Math.min(ay, by) - R || py > Math.max(ay, by) + R) continue;
-          lo = Math.min(lo, ax - R, bx - R); hi = Math.max(hi, ax + R, bx + R);
-        }
-        for (let gx = Math.floor(lo / cw); gx <= Math.floor(hi / cw); gx++) {
-          const px = (gx + 0.5) * cw;
-          let best = 1e18, along = 0, lat = 0, bj = 0;
-          for (let j = 0; j < n - 1; j++) {
-            const ux = U[2 * j], uy = U[2 * j + 1], dx = px - p[2 * j], dy = py - p[2 * j + 1];
-            const t = clamp(dx * ux + dy * uy, j === 0 ? -seg : 0, j === n - 2 ? 1e9 : seg);
-            const qx = dx - ux * t, qy = dy - uy * t, d2 = qx * qx + qy * qy;
-            if (d2 < best) { best = d2; along = j * seg + t; lat = ux * dy - uy * dx; bj = j; }
-          }
-          lat = (lat < 0 ? -1 : 1) * Math.sqrt(best); // true distance to the segment, not its infinite line (bends)
-          Q.x = along * k; Q.y = lat * k; Q.th = TH[bj];
-          const code = sp.cell(a, Q);
-          if (code) push(gx, gy, code);
-        }
-      }
-      putEyes(sp, a, p[0], p[1], U[0], U[1], u * sc, cw, ch);
-      return BUF.n;
-    }
-    // offsets in local units: px, py = (screen offset in CSS px) / (u * sc)
-    const co = Math.cos(a.dir), si = Math.sin(a.dir), box = sp.box, bx0 = box[0], bx1 = box[1], by0 = box[2], by1 = box[3], k = 1 / (u * sc);
-    const pyMin = Math.min(bx0 * si, bx1 * si) + Math.min(by0 * co, by1 * co), pyMax = Math.max(bx0 * si, bx1 * si) + Math.max(by0 * co, by1 * co);
-    for (let gy = Math.floor((a.y + pyMin / k) / ch - 0.5); gy <= Math.ceil((a.y + pyMax / k) / ch); gy++) {
-      const py = ((gy + 0.5) * ch - a.y) * k;
-      SPAN[0] = -1e9; SPAN[1] = 1e9;
-      span(co, py * si, bx0, bx1); // local x = px*co + py*si
-      span(-si, py * co, by0, by1); // local y = -px*si + py*co
-      const lo = SPAN[0], hi = SPAN[1];
-      if (lo > hi) continue;
-      for (let gx = Math.ceil((a.x + lo / k) / cw - 0.5); gx <= Math.floor((a.x + hi / k) / cw - 0.5); gx++) {
-        const px = ((gx + 0.5) * cw - a.x) * k;
-        Q.x = px * co + py * si; Q.y = -px * si + py * co;
-        const code = sp.cell(a, Q);
-        if (code) push(gx, gy, code);
-      }
-    }
-    putEyes(sp, a, a.x, a.y, co, si, u * sc, cw, ch);
-    return BUF.n;
+  cruise(e) {
+    return this.animal.speed * (0.55 + 0.45 * e.depth) * this.tuning.speed;
   }
-  raster.buf = BUF; // the cells of the last raster() call
-
-  // Occlusion, as on a character grid: nearer animals claim their cells, and their tiles also claim a one-cell
-  // moat around them; farther animals draw nothing on claimed cells, so an overlap stays a clean front silhouette
-  // with a thin band of background around it. Calls emit(animal, gx, gy, code) for every visible on-screen cell.
-  const OCC = { a: new Uint32Array(0), cols: 0, rows: 0, stamp: 0 };
-  function compose(world, emit) {
-    const cols = Math.ceil(world.w / world.cw) + 1, rows = Math.ceil(world.h / world.ch) + 1, all = world.animals;
-    if (cols !== OCC.cols || rows !== OCC.rows || OCC.stamp > 1e9) {
-      if (OCC.a.length < cols * rows) OCC.a = new Uint32Array(cols * rows);
-      OCC.a.fill(0); OCC.cols = cols; OCC.rows = rows; OCC.stamp = 0;
-    }
-    const occ = OCC.a, st = ++OCC.stamp;
-    for (let i = all.length - 1; i >= 0; i--) { // the list is far-first, so walk it near-first
-      const a = all[i], n = raster(world, a);
-      let m = 0;
-      for (let c = 0; c < n; c++) {
-        const gx = BUF.x[c], gy = BUF.y[c], code = BUF.c[c];
-        if (gx < 0 || gy < 0 || gx >= cols || gy >= rows || occ[gy * cols + gx] === st) continue;
-        BUF.x[m] = gx; BUF.y[m] = gy; BUF.c[m++] = code; // keep the visible cells to claim them below
-        emit(a, gx, gy, code);
-      }
-      for (let c = 0; c < m; c++) {
-        const gx = BUF.x[c], gy = BUF.y[c], kind = BUF.c[c] >> 16;
-        if (kind !== TILE && kind !== EYE) { occ[gy * cols + gx] = st; continue; }
-        for (let y = Math.max(0, gy - 1); y <= Math.min(rows - 1, gy + 1); y++) {
-          for (let x = Math.max(0, gx - 1); x <= Math.min(cols - 1, gx + 1); x++) occ[y * cols + x] = st;
-        }
-      }
-    }
-  }
-  // Scratch reused on every call: doubles passed to a non-inlined cell() would be boxed, ~10 MB/frame at 4K.
-  const Q = { x: 0.5, y: 0.5, tw: 0.5, th: 0.5 }, SPAN = new Float64Array(2);
-  // solve px*q + b in [l, h] for px, narrowing SPAN = [lo, hi]: the raster box's span on one row
-  function span(q, b, l, h) {
-    if (Math.abs(q) < 1e-9) { if (b < l || b > h) { SPAN[0] = 1; SPAN[1] = 0; } return; }
-    const p1 = (l - b) / q, p2 = (h - b) / q;
-    SPAN[0] = Math.max(SPAN[0], Math.min(p1, p2)); SPAN[1] = Math.min(SPAN[1], Math.max(p1, p2));
-  }
-  const SEGS = { u: new Float64Array(64), th: new Float64Array(32) }; // per-call spine scratch (no per-frame allocation)
-
-  // ---------- simulation ----------
-  // Animals on screen: the reference count, scaled by Density, and by 1/Size² above the default Size (bigger bodies cover
-  // more cells, so fewer of them; it also keeps the paint cost bounded). The window size does not matter: the scene scales.
-  function countFor(s, animal) {
-    const big = Math.min(1, (DEFAULTS.size / s.size) ** 2);
-    return clamp(Math.round(LIVE[animal].n * (s.density / DEFAULTS.density) * big), 1, MAX_ANIMALS);
-  }
-  function weighted(ws, q) {
-    let t = q * ws.reduce((n, w) => n + w, 0), i = 0;
-    while (i < ws.length - 1 && t >= ws[i]) t -= ws[i++];
-    return i;
-  }
-
-  function spawn(world) {
-    const sp = SPECIES[world.animal], r = world.rng;
-    const a = {
-      x: r() * world.w, y: r() * world.h, dir: world.heading + (r() - 0.5) * 0.2, ang: 0, sp: 0, kx: 0, ky: 0, boost: 1,
-      bias: r() - 0.5, t: r() * 10, at: r() * 10, gl: 0, gt: r() * 2, gliding: false, ph: r() * TAU, timer: r() * 1.5,
-      mode: sp.mode0 || '', flee: 0, fleeDir: 0, seed: Math.floor(r() * 1e6), lvl: weighted(world.levels.map((l) => l.w), r()),
-      pal: sp.pals ? weighted(sp.pals, r()) : 0, cap: r() < 0.3, eating: false, rnd: r, trail: [], spine: null, spineU: 0, sx: 0, sv: 0,
-    };
-    a.ang = a.dir;
-    return a;
-  }
-
-  // ---------- spacing ----------
-  // The reference swarms are spread evenly with empty space between individuals; overlaps are rare and brief.
-  const radius = (world, a) => SPECIES[world.animal].space * world.levels[a.lvl].s * world.u;
-  // Free room around point (x, y) for animal a: the smallest gap to any other animal's spacing circle.
-  function room(world, a, x, y) {
-    let best = 1e9;
-    const ra = radius(world, a);
-    for (const b of world.animals) {
-      if (b === a) continue;
-      best = Math.min(best, Math.hypot(b.x - x, b.y - y) - ra - radius(world, b));
-    }
-    return best;
-  }
-  // Best of k candidates (Mitchell's blue noise): the roomiest spot; pts(i) proposes the i-th candidate.
-  function roomiest(world, a, k, pts) {
-    let bx = a.x, by = a.y, br = -1e9;
-    for (let i = 0; i < k; i++) {
-      const p = pts(i), r = room(world, a, p[0], p[1]);
-      if (r > br) { br = r; bx = p[0]; by = p[1]; }
-    }
-    a.x = bx; a.y = by;
-  }
-  // Neighbours drift apart sideways (across the common heading) and same-depth ones adjust their speed a little,
-  // so nobody leaves the parallel heading. Writes a.sx (sideways push, units/s) and a.sv (speed factor offset).
-  // Separation scales both the reach and the strength (1 = the default 700).
-  function separate(world, FX, FY) {
-    const all = world.animals, n = all.length, f = world.sep, reach = 1.25 * Math.sqrt(f);
-    for (const a of all) { a.sx = 0; a.sv = 0; }
-    if (f <= 0) return;
-    for (let i = 0; i < n; i++) {
-      const a = all[i], ra = radius(world, a);
-      for (let j = i + 1; j < n; j++) {
-        const b = all[j], dx = b.x - a.x, dy = b.y - a.y, R = (ra + radius(world, b)) * reach;
-        if (dx > R || dx < -R || dy > R || dy < -R) continue;
-        const d = Math.hypot(dx, dy);
-        if (d >= R) continue;
-        const o = 1 - d / R, same = a.lvl === b.lvl, lat = dy * FX - dx * FY, sg = lat > 0 || (lat === 0 && i & 1) ? 1 : -1;
-        const push = o * (same ? 3 : 1.5) * Math.min(f, 2);
-        a.sx -= sg * push; b.sx += sg * push;
-        if (same) { const ahead = dx * FX + dy * FY > 0 ? 1 : -1; a.sv -= ahead * o * 0.25; b.sv += ahead * o * 0.25; }
-      }
-    }
-  }
-  // A point just inside the trailing edges of the play area (the edges the heading points away from), picked with
-  // probability proportional to how much of the swarm enters through each.
-  function entry(world, m, FX, FY) {
-    const r = world.rng, W = world.w + 2 * m, Hh = world.h + 2 * m, wx = Math.abs(FX) * Hh, wy = Math.abs(FY) * W, t = r() * (wx + wy);
-    if (t < wx) return [FX > 0 ? 1 - m : world.w + m - 1, r() * Hh - m];
-    return [r() * W - m, FY > 0 ? 1 - m : world.h + m - 1];
-  }
-
-  // Applies settings (and the screen size) to a world: derived tweak values live on the world.
-  function configure(world, s, animal) {
-    if (animal !== world.animal) {
-      world.animal = animal; world.animals.length = 0; world.pellets.length = 0;
-    }
-    const e = (k) => eff(s, animal, k), detail = e('detail');
-    world.s = s;
-    world.speed = s.speed / DEFAULTS.speed;
-    // the scene scales with the window width (the floor covers a 0-sized first layout)
-    const fit = Math.max(world.w, MIN_W) / REF_W;
-    world.u = (UNIT * fit * s.size) / DEFAULTS.size; // body unit, CSS px
-    world.cw = (Math.max(world.w, MIN_W) / COLS) * (DEFAULTS.detail / detail); world.ch = world.cw * CELL_ASPECT; // cell, CSS px (start() snaps to device px)
-    world.heading = s.corner ? Math.atan2(-world.h, world.w) : (-s.direction * Math.PI) / 180; // screen angle, y down
-    world.levels = levelsFor(s, animal);
-    const ws = world.levels.map((l) => l.w), wsig = ws.join();
-    if (wsig !== world.wsig) { world.wsig = wsig; for (const a of world.animals) a.lvl = weighted(ws, world.rng()); } // Far bias applies live
-    world.sway = e('sway'); world.spread = e('spread'); world.flutter = s.flutter; world.hold = e('hold'); world.sep = e('separation') / DEFAULTS.separation;
-    world.glide = e('glide'); world.pause = s.glide / DEFAULTS.glide; world.flap = s.flapRate;
-    world.trail = Math.round(e('trail') * 4); world.trailFade = e('trailFade'); world.shimmer = e('shimmer'); world.sparkle = e('sparkle');
-    for (const a of world.animals) a.spine = null; // body length follows size and depth
-    const n = countFor(s, animal);
-    while (world.animals.length < n) {
-      const a = spawn(world), r = world.rng;
-      roomiest(world, a, world.sep > 0 ? 14 : 1, () => [r() * world.w, r() * world.h]); // even spread from the first frame
-      world.animals.push(a);
-    }
-    world.animals.sort((p, q) => q.lvl - p.lvl); // far (small) first, so near animals are drawn over them
-    const all = world.animals, len = all.length; // fewer animals: thin evenly across the sorted list so every depth keeps some
-    if (len > n) world.animals = Array.from({ length: n }, (_, i) => all[Math.floor(((i + 0.5) * len) / n)]);
-  }
-
-  function createWorld(s, animal, w, h, rng) {
-    const world = { animal: null, w, h, t: 0, dt: 0, rng: rng || Math.random, animals: [], pellets: [], ripples: [] };
-    configure(world, s, animal);
-    return world;
-  }
-
-  const marginOf = (world, a) => (SPECIES[world.animal].reach * world.levels[a.lvl].s + 2) * world.u;
-
-  function step(world, dtSec) {
-    const dt = (dtSec > 0 ? Math.min(dtSec, 0.05) : 0) * world.speed; // clamp: a long hidden tab must not teleport animals
-    world.dt = dt; world.t += dt;
-    const sp = SPECIES[world.animal], u = world.u, k = Math.exp(-2.5 * dt), hd = world.heading, FX = Math.cos(hd), FY = Math.sin(hd);
-    if (dt > 0) separate(world, FX, FY);
-    for (const a of world.animals) {
-      a.t += dt; a.at += dt * world.flap;
-      if (world.glide > 0 || a.gliding) { // Glide: spells of held wings / relaxed strokes between bouts of flapping
-        a.gt -= dt;
-        if (a.gt <= 0) { a.gliding = !a.gliding && world.glide > 0; a.gt = a.gliding ? (0.3 + a.rnd() * 0.5) * world.glide : (0.8 + a.rnd() * 1.2) / world.flap; }
-      }
-      a.gl += ((a.gliding ? 1 : 0) - a.gl) * Math.min(1, dt * 5);
-      // one shared heading (Spread fans individuals out, Sway weaves, Flutter jitters); Hold course is how fast they
-      // return to it; a click turns animals away for a moment, koi turn to food
-      let target = hd + a.bias * 2 * world.spread + Math.sin(a.t * 0.6 + a.ph) * 0.05 + Math.sin(a.t * 1.3 + 2 * a.ph) * world.sway;
-      if (world.flutter) target += (vn(a.t * 2.5, a.seed % 997, 5) - 0.5) * world.flutter * 1.6;
-      let rate = 0.3 * world.hold;
-      if (a.flee > 0) { a.flee -= dt; target = a.fleeDir; rate = 7; }
-      a.eating = false;
-      if (sp.spine && world.pellets.length) {
-        const sc = world.levels[a.lvl].s;
-        let best = null, bd = (u * 28) ** 2;
-        for (const p of world.pellets) { const d2 = (p.x - a.x) ** 2 + (p.y - a.y) ** 2; if (d2 < bd) { bd = d2; best = p; } }
-        if (best) {
-          a.eating = true; target = Math.atan2(best.y - a.y, best.x - a.x); rate = 2.6;
-          if (bd < (u * Math.max(1.2, 1.6 * sc)) ** 2) best.life = 0;
-        }
-      }
-      a.dir += wrapPi(target - a.dir) * Math.min(1, dt * rate);
-      a.dir = wrapPi(a.dir);
-      a.ang = a.dir;
-      a.sp = sp.gait(a, dt * world.flap, world);
-      a.boost = 1 + (a.boost - 1) * Math.exp(-1.5 * dt);
-      const calm = a.flee <= 0 && !a.eating; // spacing: off while scattering or feeding
-      const v = a.sp * a.boost * world.levels[a.lvl].k * u * (calm ? 1 + clamp(a.sv, -0.3, 0.3) : 1);
-      const sx = calm ? clamp(a.sx * u, -MAX_LATERAL * v, MAX_LATERAL * v) : 0; // the sideways push turns the travel direction by at most ~10 degrees
-      a.x += (Math.cos(a.dir) * v + a.kx - FY * sx) * dt; a.y += (Math.sin(a.dir) * v + a.ky + FX * sx) * dt;
-      a.kx *= k; a.ky *= k;
-      const m = marginOf(world, a);
-      if (a.x < -m || a.x > world.w + m || a.y < -m || a.y > world.h + m) {
-        const ox = a.x, oy = a.y;
-        if ((a.x - world.w / 2) * FX + (a.y - world.h / 2) * FY > 0) roomiest(world, a, 8, () => entry(world, m, FX, FY)); // left ahead: re-enter behind, where it is roomy
-        else { a.x = mod(a.x + m, world.w + 2 * m) - m; a.y = mod(a.y + m, world.h + 2 * m) - m; } // pushed out backwards (a scatter): plain wrap
-        a.trail.length = 0;
-        if (a.spine) for (let j = 0; j < a.spine.length; j += 2) { a.spine[j] += a.x - ox; a.spine[j + 1] += a.y - oy; }
-      }
-      if (sp.spine) followSpine(a, sp, u, world);
-      const tr = a.trail, l = tr[tr.length - 1];
-      if (!world.trail) tr.length = 0;
-      else if (!l || Math.hypot(a.x - l.x, a.y - l.y) >= u * 1.5) { tr.push({ x: a.x, y: a.y, t: world.t }); while (tr.length > world.trail) tr.shift(); }
-    }
-    for (const p of world.pellets) { p.life -= dt; p.y += u * 0.2 * dt; }
-    world.pellets = world.pellets.filter((p) => p.life > 0);
-    for (const r of world.ripples) r.age += dt;
-    world.ripples = world.ripples.filter((r) => r.age < 1.4);
-  }
-
-  // Click: a dotted ripple; koi get a cluster of food, everything else turns and flees, then rejoins the heading.
-  function poke(world, x, y) {
-    const u = world.u, r = world.rng;
-    world.ripples.push({ x, y, age: 0 });
-    if (SPECIES[world.animal].spine) { // koi: food
-      for (let i = 0; i < 14 && world.pellets.length < 120; i++) {
-        const ang = r() * TAU, d = Math.sqrt(r()) * 4.5 * u;
-        world.pellets.push({ x: x + Math.cos(ang) * d, y: y + Math.sin(ang) * d, life: 7 + r() * 3 });
-      }
+  startle(e, s) {
+    if (this.animal.tap) {
+      this.animal.tap(e, s, this);
       return;
     }
-    const R = u * 20;
-    for (const a of world.animals) {
-      const dx = a.x - x, dy = a.y - y, d = Math.hypot(dx, dy);
-      if (d >= R) continue;
-      const f = 1 - d / R;
-      a.fleeDir = Math.atan2(dy, dx); a.flee = 0.35 + 0.5 * f; a.boost = 1 + 2.2 * f;
-      a.kx += (dx / (d || 1)) * f * u * 12; a.ky += (dy / (d || 1)) * f * u * 12;
+    this.events.push({ x: e, y: s, radius: 6, amount: 1.4 });
+    for (const i of this.creatures) {
+      const n = i.x - e,
+        a = i.y - s,
+        o = Math.hypot(n, a) || 1;
+      if (o > pe) continue;
+      const r = 1 - o / pe;
+      if (this.animal.startle) this.animal.startle(i, n / o, a / o, r, this);
+      else {
+        const h = r * 420 * i.depth;
+        (i.vx += (n / o) * h),
+          (i.vy += (a / o) * h),
+          (i.startledUntil = this.time + F(0.6, 1.2));
+      }
     }
   }
-
-  // ---------- rendering (browser only) ----------
-  function hex(c) { const n = parseInt(c.slice(1), 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
-  const BGC = hex(BG);
-  const mix = (c, d, t) => c.map((v, i) => Math.round(v + (d[i] - v) * t));
-  const css = (c) => 'rgb(' + c.join(',') + ')';
-
-  // ---------- background tone ----------
-  // Background 0..1 mixes the near-black BG toward white (linear in sRGB). Everything light-on-dark (bare glyphs, eye tiles,
-  // ripple dots, the grid lines, the new-tab text) is derived from it once per tone (lookOf is memoised): adapt(c) keeps the
-  // contrast colour c has on the default background, on this one, using whichever side (lighter or darker than the
-  // background) is chosen by the background's luminance. Black and white contrast equally with a luminance of 0.179 (4.58:1),
-  // so the side flips there and the best available contrast never drops below that.
-  const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
-  const unlin = (v) => Math.round(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
-  const lumOf = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
-  const contrast = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
-  const LUM0 = lumOf(BGC), GRID_K = [132, 141, 172]; // the grid line colour is the background shifted by GRID_K (BGC + GRID_K = 140,150,185)
-  const LOOKS = new Map();
-  function lookOf(tone) {
-    let L = LOOKS.get(tone);
-    if (L) return L;
-    const rgb = mix(BGC, [255, 255, 255], tone), lum = lumOf(rgb), light = lum > 0.1791, sg = light ? -1 : 1;
-    L = {
-      tone, rgb, css: css(rgb), light, lum,
-      grid: rgb.map((v, i) => clamp(v + sg * GRID_K[i], 0, 255)), // the colour the grid lines blend toward
-      lit: light ? [10, 10, 14] : [255, 255, 255], // shimmer / sparkle push tiles toward this
-      pupil: light ? [238, 238, 238] : [12, 12, 14],
-      adapt: tone === 0 ? (c) => c : (c) => {
-        const Lc = lumOf(c), Cd = Math.max(1, (Lc + 0.05) / (LUM0 + 0.05));
-        const T = light ? Math.max(0, (lum + 0.05) / Cd - 0.05) : Math.min(1, Cd * (lum + 0.05) - 0.05); // luminance with the same contrast
-        return c.map((v) => { v = lin(v); return unlin(T > Lc ? v + ((1 - v) * (T - Lc)) / (1 - Lc) : Lc ? (v * T) / Lc : 0); });
-      },
+  step(e) {
+    var s, i;
+    (this.time += e), this.populate(!1);
+    for (const n of this.creatures)
+      (n.depth = this.depthOf(n.roll)),
+        (n.span = this.base * n.depth * this.tuning.size);
+    (i = (s = this.animal).prepare) == null || i.call(s, this, e);
+    for (const n of this.creatures) this.animal.update(n, this, e);
+  }
+  populate(e) {
+    var i, n;
+    const s = this.target;
+    for (; this.creatures.length > s; ) {
+      const [a] = this.creatures.splice(
+        Math.floor(Math.random() * this.creatures.length),
+        1,
+      );
+      a.gone = !0;
+    }
+    for (; this.creatures.length < s; ) {
+      const a = this.spawn();
+      (e || Math.random() < 0.5) &&
+        ((a.x = F(0, this.width)),
+        (a.y = F(0, this.height)),
+        (n = (i = this.animal).enter) == null || n.call(i, a, this)),
+        this.insert(a);
+    }
+  }
+  insert(e) {
+    const s = this.creatures.findIndex((i) => i.roll > e.roll);
+    this.creatures.splice(s < 0 ? this.creatures.length : s, 0, e);
+  }
+  spawn() {
+    const e = {
+      id: this.nextId++,
+      roll: Math.random(),
+      depth: 1,
+      span: 0,
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      heading: 0,
+      bias: 0,
+      startledUntil: 0,
+      gone: !1,
     };
-    L.ripple = css(L.adapt([200, 204, 216]));
-    LOOKS.set(tone, L);
-    return L;
+    (e.depth = this.depthOf(e.roll)),
+      (e.span = this.base * e.depth * this.tuning.size);
+    const s = this.animal.create(e, this);
+    return this.reenter(s), s;
   }
-  const LOOK0 = lookOf(0);
-  // The background of these settings (any shape normalize accepts): { rgb, css, light, lum, adapt(rgb) } for hosts that draw UI over the canvas.
-  const backgroundOf = (settings) => lookOf(normalize(settings).background);
-
-  // Hue shift: the CSS hue-rotate() matrix.
-  function hueRotate(c, deg) {
-    if (!deg) return c;
-    const r = (deg * Math.PI) / 180, co = Math.cos(r), si = Math.sin(r);
-    const m = [0.213 + co * 0.787 - si * 0.213, 0.715 - co * 0.715 - si * 0.715, 0.072 - co * 0.072 + si * 0.928,
-      0.213 - co * 0.213 + si * 0.143, 0.715 + co * 0.285 + si * 0.14, 0.072 - co * 0.072 - si * 0.283,
-      0.213 - co * 0.213 - si * 0.787, 0.715 - co * 0.715 + si * 0.715, 0.072 + co * 0.928 + si * 0.072];
-    return [0, 1, 2].map((i) => clamp(Math.round(m[3 * i] * c[0] + m[3 * i + 1] * c[1] + m[3 * i + 2] * c[2]), 0, 255));
+  reenter(e) {
+    var d, u;
+    const { width: s, height: i, course: n } = this,
+      a = e.span * 0.6,
+      o = Math.cos(n),
+      r = Math.sin(n),
+      h = i * Math.abs(o),
+      l = s * Math.abs(r);
+    Math.random() * (h + l) < h
+      ? ((e.x = o >= 0 ? -a : s + a), (e.y = F(0, i)))
+      : ((e.x = F(0, s)), (e.y = r <= 0 ? i + a : -a));
+    const c = this.cruise(e);
+    (e.heading = n),
+      (e.vx = o * c),
+      (e.vy = r * c),
+      (e.bias = F(-1, 1)),
+      (u = (d = this.animal).enter) == null || u.call(d, e, this);
   }
-  // The tile colour of a cell: Hue shift, depth fade (halo and eye tiles differ), then the lit variants: 0 plain,
-  // 1 shimmer-lit, 2 sparkle.
-  function cellColor(sp, code, dim, hue, variant, look) {
-    look = look || LOOK0;
-    const kind = code >> 16;
-    let c = kind === EYE ? [238, 238, 238] : hueRotate(hex(sp.P.cols[(code >> 8) & 255]), hue);
-    if (kind === BARE || kind === EYE) c = look.adapt(c); // light-on-dark parts stay readable on a light background; tiles keep their colour
-    const col = mix(c, look.rgb, kind === HALO ? 0.55 + dim * 0.4 : dim);
-    return variant ? mix(col, look.lit, variant === 1 ? 0.3 : 0.8) : col;
+  passed(e, s = e.span) {
+    const { width: i, height: n, course: a } = this,
+      o = Math.cos(a),
+      r = Math.sin(a),
+      h =
+        (o > 0.05 && e.x > i + s) ||
+        (o < -0.05 && e.x < -s) ||
+        (r < -0.05 && e.y < -s) ||
+        (r > 0.05 && e.y > n + s),
+      l = e.x < -3 * s || e.x > i + 3 * s || e.y < -3 * s || e.y > n + 3 * s;
+    return h || l;
   }
-  // Shimmer: a slow band of lighter tiles drifting across the swarm; Sparkle: single tiles flashing near-white.
-  // The look of a cell right now: 0 plain, 1 shimmer-lit, 2 sparkle (tiles only).
-  function variantOf(world, a, gx, gy, code) {
-    if (code >> 16 !== TILE) return 0;
-    if (world.sparkle && H(gx, gy, Math.floor(world.t * 6) + a.seed) < world.sparkle * 0.06) return 2;
-    return world.shimmer && vn(gx * 0.3 - world.t * 1.5, gy * 0.3, 11) > 1 - world.shimmer * 0.4 ? 1 : 0;
+  begin() {
+    return (this.acc.x = 0), (this.acc.y = 0), this.acc;
   }
-  // Pre-rendered cells (tile + glyph per colour, depth, glyph and variant: 0 plain, 1 shimmer-lit, 2 sparkle) in
-  // fixed-size pages, filled on first use. Bounded: when every slot is used it starts over. Rebuilt when the species,
-  // cell size, DPR, hue, background or depth fade changes.
-  function makeAtlas(sp, gw, gh, levels, hue, look) {
-    const PER = 32, MAX = PER * PER * 4, pages = [], map = new Map(); // pages are created on demand, at most 4
-    let n = 0;
-    const font = (k) => k * gw + 'px Menlo, Consolas, "DejaVu Sans Mono", "Courier New", monospace';
-    function paint(i, code, lvl, variant) {
-      const pi = Math.floor(i / (PER * PER)), slot = i % (PER * PER);
-      if (!pages[pi]) { const c = document.createElement('canvas'); c.width = PER * gw; c.height = PER * gh; pages[pi] = c; }
-      const x = pages[pi].getContext('2d'), sx = (slot % PER) * gw, sy = Math.floor(slot / PER) * gh;
-      const kind = code >> 16, g = code & 255, dim = levels[lvl].dim;
-      x.clearRect(sx, sy, gw, gh);
-      x.textAlign = 'center'; x.textBaseline = 'middle';
-      const col = cellColor(sp, code, dim, hue, variant, look);
-      const gap = Math.max(1, Math.round(gw * 0.13)), tw = gw - gap, th = gh - gap, mx = sx + gw / 2, my = sy + gh / 2;
-      const glyph = (color, k) => {
-        x.fillStyle = css(color);
-        if (GL[g] === '•') { x.beginPath(); x.arc(mx, my, gw * (k > 1 ? 0.3 : 0.16), 0, TAU); x.fill(); return; }
-        x.font = font(k); x.fillText(GL[g], mx, my + gh * 0.03);
-      };
-      if (kind === BARE) { glyph(col, 1.05); return; }
-      x.fillStyle = css(col);
-      x.beginPath();
-      if (x.roundRect) x.roundRect(sx + gap / 2, sy + gap / 2, tw, th, tw * 0.18); else x.rect(sx + gap / 2, sy + gap / 2, tw, th);
-      x.fill();
-      if (kind === EYE) { x.fillStyle = css(mix(look.pupil, look.rgb, dim)); x.beginPath(); x.ellipse(mx, my, tw * 0.3, th * 0.26, 0, 0, TAU); x.fill(); return; }
-      if (!g) return;
-      const lum = (0.3 * col[0] + 0.59 * col[1] + 0.11 * col[2]) / 255;
-      glyph(sp.glyph ? sp.glyph(col) : lum > 0.4 ? mix(col, [0, 0, 0], 0.6) : mix(col, [255, 255, 255], 0.42), 0.85);
-    }
-    return {
-      pages,
-      get(code, lvl, variant) { // returns the slot index
-        const key = (code * 8 + lvl) * 3 + variant;
-        let i = map.get(key);
-        if (i === undefined) {
-          if (n >= MAX) { map.clear(); n = 0; }
-          i = n++; paint(i, code, lvl, variant); map.set(key, i);
+  steer(e, s, i, n) {
+    (this.acc.x += (Math.cos(s) * i - e.vx) * n),
+      (this.acc.y += (Math.sin(s) * i - e.vy) * n);
+  }
+  separate(e, s = this.tuning.separation, i = 0.42) {
+    if (!(s <= 0))
+      for (const n of this.creatures) {
+        if (n === e || Math.abs(n.depth - e.depth) > 0.18) continue;
+        const a = e.x - n.x,
+          o = e.y - n.y,
+          r = Math.hypot(a, o),
+          h = (e.span + n.span) * i;
+        if (r < h && r > 0.001) {
+          const l = (1 - r / h) * s;
+          (this.acc.x += (a / r) * l), (this.acc.y += (o / r) * l);
         }
-        return i;
-      },
-      draw(ctx, i, gx, gy) { // at grid cell (gx, gy), in device pixels
-        const slot = i % (PER * PER);
-        ctx.drawImage(pages[Math.floor(i / (PER * PER))], (slot % PER) * gw, Math.floor(slot / PER) * gh, gw, gh, gx * gw, gy * gh, gw, gh);
-      },
-    };
+      }
   }
-
-  function start(canvas, settings) {
-    const ctx = canvas.getContext('2d');
-    const raw = {};
-    const merge = (p) => { for (const k in p) if (p[k] !== undefined) raw[k] = p[k]; };
-    let dpr = 0, gw = 0, gh = 0, last = 0, raf = 0, grid = null, atlas = null, fps = 0, sig = '', look = LOOK0;
-    // Reduced motion: slowest speed and no click scatter (koi food is still fine). matchMedia is absent in node.
-    const mq = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
-    let reduce = !!(mq && mq.matches);
-
-    merge(settings);
-    let s = normalize(raw);
-    let animal = s.animal;
-    const world = createWorld(s, animal, window.innerWidth, window.innerHeight, Math.random);
-    const settle = () => {
-      configure(world, s, animal);
-      look = lookOf(s.background);
-      if (reduce) world.speed = LIMITS.speed[0] / DEFAULTS.speed;
-      const d = dpr || 1;
-      const w = Math.max(4, Math.round(world.cw * d)), h = Math.max(5, Math.round(world.ch * d));
-      // whole device pixels per cell keep tiles crisp; the atlas and grid follow species, cell size, DPR and look
-      const k = [world.animal, w, h, s.hue, s.background, s.grid, world.levels.map((l) => l.dim).join()].join('|');
-      if (k !== sig) { sig = k; gw = w; gh = h; atlas = null; grid = null; }
-      world.u *= gw / d / world.cw; // bodies keep their size in cells when the cell is snapped (or floored) to whole device pixels
-      world.cw = gw / d; world.ch = gh / d;
-    };
-
-    function resize() {
-      const d = window.devicePixelRatio || 1;
-      const ow = world.w, oh = world.h;
-      world.w = window.innerWidth; world.h = window.innerHeight;
-      for (const a of world.animals) { // keep the spread across the new size; a 0-sized first layout means re-scatter
-        a.x = ow > 0 ? (a.x * world.w) / ow : Math.random() * world.w;
-        a.y = oh > 0 ? (a.y * world.h) / oh : Math.random() * world.h;
-        a.trail.length = 0; a.spine = null;
+  move(e, s, i) {
+    (e.vx += this.acc.x * s), (e.vy += this.acc.y * s);
+    let n = Math.hypot(e.vx, e.vy);
+    const a = i + (this.time < e.startledUntil ? 300 : 0);
+    return (
+      n > a && ((e.vx *= a / n), (e.vy *= a / n), (n = a)),
+      (e.x += e.vx * s),
+      (e.y += e.vy * s),
+      n
+    );
+  }
+  face(e, s, i = 7, n = Math.atan2(e.vy, e.vx)) {
+    const a = i * s;
+    e.heading += R(dt(e.heading, n), -a, a);
+  }
+}
+const xt = 0,
+  V = 1,
+  Ye = 2,
+  wt = 3,
+  Dt = 4,
+  pt = 5,
+  ze = 6,
+  X = 7;
+function w(t, e, s, i, n = xt, a = null) {
+  return (t.r = e), (t.g = s), (t.b = i), (t.kind = n), (t.glyphs = a), !0;
+}
+const ut = {
+    from: -0.3,
+    to: 1,
+    reach: 0.56,
+    peak: 0.55,
+    round: 0.5,
+    scallop: 0,
+  },
+  as = {
+    from: -1.45,
+    to: 0.15,
+    reach: 0.44,
+    peak: 0.48,
+    round: 0.42,
+    scallop: 0.04,
+  },
+  me = 0.06,
+  os = -0.02,
+  rs = [30, 30, 42],
+  hs = 2.6,
+  ls = 0.35,
+  cs = 1.3;
+function ds(t, e, s = (e - t.from) / (t.to - t.from)) {
+  if (s <= 0 || s >= 1) return 0;
+  const i =
+      s < t.peak
+        ? (s / t.peak) * 0.5
+        : 0.5 + ((s - t.peak) / (1 - t.peak)) * 0.5,
+    n = t.reach * Math.pow(Math.sin(Math.PI * i), t.round);
+  return t.scallop
+    ? n * (1 - t.scallop * (0.5 + 0.5 * Math.cos(s * Math.PI * 14)))
+    : n;
+}
+function us(t) {
+  return t > 0.17 || t < -0.32
+    ? 0
+    : t > 0.11
+      ? Math.sqrt(Math.max(0, 0.03 * 0.03 - (t - 0.14) ** 2))
+      : t > -0.04
+        ? 0.034
+        : 0.03 * (1 - 0.6 * ((-0.04 - t) / 0.28));
+}
+const se = { t: 0, r: 0 };
+function fe(t, e, s) {
+  const i = Math.atan2(e, s),
+    n = (i - t.from) / (t.to - t.from),
+    a = ds(t, i, n),
+    o = Math.hypot(e, s);
+  return o > a ? !1 : ((se.t = n), (se.r = o / a), !0);
+}
+const ps = {
+    ...gt,
+    density: 1.05,
+    speed: 1.05,
+    sway: 0,
+    spread: 0,
+    size: 1.25,
+    farthest: 0.18,
+    farBias: 1.7,
+    grip: 5,
+    separation: 700,
+    trail: 1.55,
+    trailFade: 0.15,
+    flutter: 0,
+    glide: 2.75,
+    flapRate: 1,
+  },
+  gs = {
+    key: "butterflies",
+    label: "Butterfly",
+    swatch: [50, 135, 255],
+    defaults: ps,
+    controls: [
+      [
+        "Flight",
+        [
+          {
+            key: "flutter",
+            label: "Flutter",
+            min: 0,
+            max: 3,
+            step: 0.05,
+            hint: "How much their path zigzags.",
+          },
+          {
+            key: "glide",
+            label: "Glide",
+            min: 0,
+            max: 4,
+            step: 0.05,
+            hint: "How often they stop flapping and glide with wings held flat.",
+          },
+          {
+            key: "flapRate",
+            label: "Flap rate",
+            min: 0.2,
+            max: 3,
+            step: 0.05,
+            hint: "How fast their wings beat.",
+          },
+        ],
+      ],
+    ],
+    area: 48e3,
+    scale: 1,
+    speed: 90,
+    trail: { light: [70, 118, 226], dark: [96, 156, 255] },
+    create: (t) => ({
+      ...t,
+      phase: F(0, B),
+      open: 1,
+      glide: 0,
+      glideUntil: 0,
+      flutterX: 0,
+      flutterY: 0,
+    }),
+    enter(t) {
+      (t.flutterX = 0), (t.flutterY = 0);
+    },
+    update(t, e, s) {
+      const i = e.tuning,
+        n = e.time,
+        a = e.cruise(t),
+        o = e.begin();
+      e.steer(t, e.heading + t.bias * i.spread, a, i.grip);
+      const r =
+        Math.sqrt(s) *
+        520 *
+        cs *
+        i.flutter *
+        (1 - 0.8 * t.glide) *
+        (0.5 + 0.5 * t.depth);
+      (t.flutterX += -t.flutterX * 3 * s + (Math.random() * 2 - 1) * r),
+        (t.flutterY += -t.flutterY * 3 * s + (Math.random() * 2 - 1) * r),
+        (o.x += t.flutterX),
+        (o.y += t.flutterY);
+      const h = Math.max(0, -Math.sin(t.phase)) * (1 - t.glide);
+      (o.x += Math.cos(t.heading) * h * a * 1.4),
+        (o.y += Math.sin(t.heading) * h * a * 1.4),
+        e.separate(t);
+      const l = e.move(t, s, a * 2.2);
+      e.passed(t) && e.reenter(t),
+        l > 12 && e.face(t, s),
+        t.glide < 0.5 &&
+          n > t.glideUntil &&
+          l > a * 0.5 &&
+          Math.random() < ls * i.glide * s &&
+          (t.glideUntil = n + F(0.5, 1.4)),
+        (t.glide +=
+          ((n < t.glideUntil ? 1 : 0) - t.glide) * Math.min(1, s * 6));
+      const c = R(l / (a * 2), 0, 1);
+      t.phase +=
+        s * B * hs * i.flapRate * (0.8 + 0.6 * c) * (1 - 0.9 * t.glide);
+      const d = Math.pow(0.5 + 0.5 * Math.cos(t.phase), 0.8);
+      t.open = 0.1 + 0.9 * (d * (1 - t.glide) + 0.96 * t.glide);
+    },
+    startle(t, e, s, i, n) {
+      const a = i * 420 * t.depth;
+      (t.vx += e * a),
+        (t.vy += s * a),
+        (t.startledUntil = n.time + F(0.6, 1.2)),
+        (t.glideUntil = 0);
+    },
+    draw(t, e) {
+      const s = t.span,
+        i = Math.max(0.08, t.open),
+        n = e.ink,
+        a = {
+          x: t.x,
+          y: t.y,
+          heading: t.heading + 0.06 * Math.sin(t.phase),
+          span: s,
+          depth: t.depth,
+          id: t.id,
+        },
+        o = e.cw * 0.4;
+      e.shape(
+        a,
+        0.75,
+        (b, g) => {
+          const p = Math.abs(g),
+            k = us(b);
+          if (k > 0 && p * s <= Math.max(k * s, o)) return w(n, ...rs, ze), !0;
+          const M = p / i;
+          let y;
+          if (fe(ut, b - me, M)) y = 0;
+          else if (fe(as, b - os, M)) y = 1;
+          else return !1;
+          const { t: f, r: m } = se;
+          return (
+            m > 0.86
+              ? y === 0 && m < 0.95 && Math.abs(Z(f * 5) - 0.5) < 0.14
+                ? w(n, 236, 240, 255, Ye)
+                : w(n, 22, 28, 62, V)
+              : m < 0.08
+                ? w(n, 26, 44, 110, V)
+                : y === 0 && f > 0.9
+                  ? w(n, 30, 50, 120, V)
+                  : w(n, 50 + 70 * m, 135 + 60 * m, 255, wt),
+            !0
+          );
+        },
+        { light: 0.6 + 0.4 * t.open, tilt: t.open * 3 },
+      );
+      const r = 0.012 * Math.sin(e.t * 3 + t.id);
+      for (const b of [-1, 1])
+        e.lineBody(
+          a,
+          0.16,
+          0.012 * b,
+          0.37 + r,
+          (0.12 + r) * b,
+          e.contrast,
+          s > 120 ? "o" : void 0,
+        );
+      const h = Math.max(0, -Math.sin(t.phase)) * (1 - t.glide),
+        l = ut.from + (ut.to - ut.from) * ut.peak,
+        c = me + Math.sin(l) * ut.reach * 0.95,
+        d = Math.cos(l) * ut.reach * 0.95 * t.open,
+        u = { x: 0, y: 0 };
+      for (const b of [-1, 1])
+        e.toWorld(a, c, d * b, u), e.shed(u.x, u.y, (0.02 + 0.1 * h) * t.depth);
+    },
+  },
+  Ot = { t: 0 };
+function Ke(t, e, s, i, n, a) {
+  const o = n - s,
+    r = a - i,
+    h = R(((t - s) * o + (e - i) * r) / (o * o + r * r || 1), 0, 1);
+  return (Ot.t = h), Math.hypot(t - s - o * h, e - i - r * h);
+}
+function ne(t, e, s, i, n, a) {
+  const o = (t - s) / n,
+    r = (e - i) / a;
+  return o * o + r * r <= 1;
+}
+function ie(t, e, s, i, n) {
+  const a = t / s,
+    o = e / s,
+    r = Math.floor(a),
+    h = Math.floor(o),
+    l = 0.25 + 0.5 * W(r, h, n),
+    c = 0.25 + 0.5 * W(r, h, n + 11),
+    d = (i / s) * (0.6 + 0.6 * W(r, h, n + 23));
+  return (a - r - l) ** 2 + (o - h - c) ** 2 < d * d;
+}
+const ms = [14, 10, 10],
+  fs = [255, 252, 246],
+  ys = {
+    ...gt,
+    detail: 1.7,
+    fog: 0.12,
+    density: 1.8,
+    sway: 0,
+    spread: 0,
+    farthest: 0.25,
+    farBias: 0.7,
+    grip: 3,
+    separation: 400,
+    trail: 1.2,
+    trailFade: 0.35,
+    shimmer: 0.1,
+    sparkle: 0.03,
+    burst: 1,
+    rest: 1,
+    legSpeed: 1,
+    scare: 0.55,
+  },
+  Ms = [204, 82, 52],
+  ws = [232, 132, 92],
+  ye = [140, 46, 32],
+  Me = [214, 92, 56],
+  xs = [60, 30, 30],
+  we = [186, 72, 44],
+  bs = [0.07, -0.01, -0.08, -0.14],
+  vs = {
+    key: "crabs",
+    label: "Crab",
+    swatch: [204, 82, 52],
+    defaults: ys,
+    controls: [
+      [
+        "Scuttling",
+        [
+          {
+            key: "burst",
+            label: "Burst length",
+            min: 0.2,
+            max: 4,
+            step: 0.05,
+            hint: "How long each scuttle lasts.",
+          },
+          {
+            key: "rest",
+            label: "Pause length",
+            min: 0,
+            max: 4,
+            step: 0.05,
+            hint: "How long they pause between scuttles. 0 means they never stop.",
+          },
+          {
+            key: "legSpeed",
+            label: "Leg speed",
+            min: 0.2,
+            max: 3,
+            step: 0.05,
+            hint: "How fast the legs step.",
+          },
+          {
+            key: "scare",
+            label: "Scare",
+            min: 0,
+            max: 3,
+            step: 0.05,
+            hint: "How fast and far crabs bolt away when you tap near them.",
+          },
+        ],
+      ],
+    ],
+    area: 7e4,
+    scale: 0.8,
+    speed: 95,
+    trail: { light: [176, 146, 104], dark: [206, 178, 136] },
+    create: (t) => ({
+      ...t,
+      running: !0,
+      until: 0,
+      facing: Math.random() < 0.5 ? 1 : -1,
+      gait: F(0, B),
+      alarm: 0,
+      fleeDir: 0,
+      fleeSpeed: 0,
+      fleeFrom: 0,
+    }),
+    enter(t, e) {
+      (t.running = !0),
+        (t.until = e.time + F(0.3, 1.2)),
+        (t.heading = e.course - (t.facing * Math.PI) / 2);
+    },
+    update(t, e, s) {
+      const i = e.tuning,
+        n = e.time;
+      n >= t.until &&
+        ((t.running = !t.running || i.rest <= 0),
+        (t.until =
+          n + (t.running ? F(0.5, 1.6) * i.burst : F(0.3, 1.4) * i.rest)));
+      const a = e.cruise(t),
+        o = e.heading + t.bias * i.spread,
+        r = n < t.startledUntil,
+        h = r ? (n - t.fleeFrom) / (t.startledUntil - t.fleeFrom) : 1,
+        l = r ? t.fleeDir : o;
+      e.begin(),
+        r
+          ? e.steer(t, t.fleeDir, Math.max(a, t.fleeSpeed * (1 - h * h)), 8)
+          : e.steer(t, o, t.running ? a : 0, i.grip * 2),
+        e.separate(t);
+      const c = e.move(t, s, r ? Math.max(a * 2, t.fleeSpeed) : a * 2);
+      e.passed(t) && e.reenter(t);
+      const d =
+          r &&
+          Math.abs(dt(t.heading + (t.facing * Math.PI) / 2, l)) > Math.PI / 2
+            ? -t.facing
+            : t.facing,
+        u = l - (d * Math.PI) / 2,
+        b = (r ? 10 : 3) * s;
+      (t.heading += Math.max(-b, Math.min(b, dt(t.heading, u)))),
+        (t.gait += (s * c * i.legSpeed) / Math.max(4, t.span * 0.09)),
+        (t.alarm = Math.max(0, t.alarm - s * 0.7));
+    },
+    startle(t, e, s, i, n) {
+      const a = n.tuning;
+      a.scare <= 0 ||
+        ((t.fleeDir = Math.atan2(s, e) + F(-0.35, 0.35)),
+        (t.fleeSpeed = n.cruise(t) * (2.5 + 3 * i) * a.scare),
+        (t.fleeFrom = n.time),
+        (t.startledUntil = n.time + (1 + 1.5 * i) * Math.sqrt(a.scare)),
+        (t.vx = Math.cos(t.fleeDir) * t.fleeSpeed),
+        (t.vy = Math.sin(t.fleeDir) * t.fleeSpeed),
+        (t.running = !0),
+        (t.until = t.startledUntil + F(0.3, 1)),
+        (t.alarm = 1));
+    },
+    draw(t, e) {
+      const s = t.span,
+        i = e.ink,
+        n = {
+          x: t.x,
+          y: t.y,
+          heading: t.heading,
+          span: s,
+          depth: t.depth,
+          id: t.id,
+        },
+        a = { x: 0, y: 0 };
+      for (const h of [-1, 1])
+        bs.forEach((l, c) => {
+          const d = t.gait + c * Math.PI * 0.5 + (h > 0 ? Math.PI : 0),
+            u = Math.max(0, Math.sin(d)),
+            b = 0.04 * Math.cos(d),
+            g = (c - 1.5) * 0.06,
+            p = l + g * 0.6,
+            k = (0.36 - 0.03 * u) * h,
+            M = l + g * 1.4 + b,
+            y = (0.52 + 0.03 * Math.cos(d) - 0.06 * u) * h;
+          e.lineBody(n, l, 0.22 * h, p, k, we),
+            e.lineBody(n, p, k, M, y, we),
+            u < 0.05 &&
+              Math.cos(d) > 0.9 &&
+              (e.toWorld(n, M, y, a), e.shed(a.x, a.y, 0.12 * t.depth));
+        });
+      const o = t.alarm;
+      e.shape(n, 0.62, (h, l) => {
+        const c = Math.abs(l),
+          d = Math.abs(h / 0.17),
+          u = c / 0.27,
+          b = h > 0.06 ? 0.06 * (0.5 + 0.5 * Math.cos(u * Math.PI * 7)) : 0;
+        if (Math.pow(d, 2.2) + Math.pow(u, 2.4) <= 1 - b)
+          return ie(h, l, 0.05, 0.012, t.id)
+            ? w(i, ...ye, V)
+            : Math.abs(c - 0.08) < 0.01 && h > -0.08 && h < 0.05
+              ? w(i, ...ye, V, "|")
+              : ne(h, c, 0.01, 0, 0.1, 0.13)
+                ? w(i, ...ws)
+                : w(i, ...Ms);
+        const g = 0.26 + 0.07 * o,
+          p = 0.25 + 0.05 * o;
+        if (Ke(h, c, 0.12, 0.17, g, p) < 0.034) return w(i, ...Me, xt);
+        const k = 0.34 + 0.08 * o,
+          M = 0.19 + 0.04 * o,
+          y = 1 + 0.15 * o,
+          f = 0.55,
+          m = ((h - k) * Math.cos(f) - (c - M) * Math.sin(f)) / y,
+          E = ((h - k) * Math.sin(f) + (c - M) * Math.cos(f)) / y;
+        if ((m / 0.09) ** 2 + (E / 0.055) ** 2 <= 1) {
+          const x = 0.15 + 0.55 * o;
+          return m > 0.02 && Math.abs(E) < x * (m - 0.02)
+            ? !1
+            : m > 0.06
+              ? w(i, ...xs, V)
+              : w(i, ...Me, xt);
+        }
+        return !1;
+      });
+      const r = Math.min(0.14, Math.max(0.06, (e.cw * 0.55) / s));
+      for (const h of [-1, 1])
+        e.toWorld(n, 0.2, r * h, a), e.spot(a.x, a.y, "●", fs, ms, t.depth);
+    },
+  },
+  Ss = {
+    ...gt,
+    detail: 1.7,
+    density: 0.8,
+    speed: 1.5,
+    sway: 0,
+    spread: 0,
+    farthest: 0.35,
+    farBias: 1.3,
+    grip: 3,
+    separation: 150,
+    trail: 0,
+    shimmer: 0.1,
+    sparkle: 0.04,
+    wingbeat: 1,
+    glide: 1,
+    foldFlap: !1,
+  },
+  lt = 0.045,
+  xe = 0.25,
+  be = 0.5,
+  ft = [236, 238, 242],
+  ve = [32, 32, 38],
+  ks = [78, 78, 92],
+  Es = [226, 36, 36],
+  Is = [14, 12, 16],
+  As = [255, 252, 246],
+  Ls = [196, 196, 150],
+  Fs = [60, 60, 66],
+  yt = { x: 0, y: 0 },
+  Rt = { s: 0, q: 0 };
+function Ts(t, e) {
+  if (e < lt || e > be) return !1;
+  const s = (e - lt) / (be - lt),
+    i = 0.12 + 0.03 * s - 0.09 * s * s;
+  let n = (-0.075 + 0.03 * s) * 1.2;
+  s < 0.78 && (n += 0.012 * (0.5 + 0.5 * Math.cos(s * B * 9)));
+  const a = s > 0.72 ? nt(n, i - 0.015, Math.pow((s - 0.72) / 0.28, 1.4)) : n;
+  if (t > i || t < a) return !1;
+  const o = (t - a) / (i - a);
+  return s > 0.78 && o < 0.92 && Z(o * 6) < 0.24
+    ? !1
+    : ((Rt.s = s), (Rt.q = o), !0);
+}
+const Y = { arm: 1, hand: 1, sweep: 0, lift: 0 },
+  Wt = 0.6,
+  Se = 0.85,
+  ke = -0.6;
+function Hs(t) {
+  const e = Math.pow(0.5 + 0.5 * Math.cos(t.phase), 0.8),
+    s = Math.max(0.12, 0.25 + 0.75 * (e * (1 - t.glide) + t.glide));
+  (Y.arm = s), (Y.hand = s), (Y.sweep = 0), (Y.lift = 0);
+}
+function Ps(t) {
+  const e = Z(t.phase / B),
+    s = (r) => 0.5 - 0.5 * Math.cos(Math.PI * r);
+  let i, n, a;
+  if (e < Wt) {
+    const r = e / Wt;
+    (i = nt(Se, ke, s(r))),
+      (n = -0.12 * Math.sin(Math.PI * r)),
+      (a = 0),
+      (Y.lift = Math.sin(Math.PI * r));
+  } else {
+    const r = (e - Wt) / (1 - Wt);
+    (i = nt(ke, Se, s(r))),
+      (n = 1.05 * Math.sin(Math.PI * r)),
+      (a = 0.45 * Math.sin(Math.PI * r)),
+      (Y.lift = 0);
+  }
+  const o = t.glide;
+  (i = nt(i, 0.1, o)),
+    (Y.sweep = nt(n, 0, o)),
+    (Y.arm = Math.cos(i)),
+    (Y.hand = Math.max(0.2, Math.cos(i + Math.sign(i || 1) * a * (1 - o)))),
+    (Y.lift *= 1 - o);
+}
+const Lt = { u: 0, v: 0 };
+function Os(t, e) {
+  const s = lt + (xe - lt) * Y.arm,
+    i = 0.03,
+    n = t - i,
+    a = e - s,
+    o = Math.cos(Y.sweep),
+    r = Math.sin(Y.sweep),
+    h = -n * r + a * o;
+  return (
+    e <= s || h < 0
+      ? ((Lt.u = t), (Lt.v = lt + (e - lt) / Y.arm))
+      : ((Lt.u = i + n * o + a * r), (Lt.v = xe + h / Y.hand)),
+    Lt
+  );
+}
+const Rs = {
+    key: "cranes",
+    label: "Crane",
+    swatch: [214, 220, 238],
+    defaults: Ss,
+    controls: [
+      [
+        "Flight",
+        [
+          {
+            key: "wingbeat",
+            label: "Wingbeat",
+            min: 0.3,
+            max: 2.5,
+            step: 0.05,
+            hint: "How fast they flap.",
+          },
+          {
+            key: "glide",
+            label: "Glide",
+            min: 0,
+            max: 4,
+            step: 0.05,
+            hint: "How often they stop flapping and glide.",
+          },
+          {
+            key: "foldFlap",
+            label: "Folding flap",
+            toggle: !0,
+            hint: "Off: the wings open and close evenly from the body. On: a slow downstroke and a quick upstroke that folds the wings back at the wrist.",
+          },
+        ],
+      ],
+    ],
+    area: 55e3,
+    scale: 1.45,
+    speed: 85,
+    trail: { light: [150, 152, 170], dark: [200, 204, 226] },
+    create: (t) => ({
+      ...t,
+      phase: F(0, B),
+      pace: 0.8 + 0.4 * W(t.id, 5, 9),
+      glide: 0,
+      glideUntil: 0,
+    }),
+    update(t, e, s) {
+      const i = e.tuning,
+        n = e.time,
+        a = e.cruise(t),
+        o = e.heading + t.bias * i.spread;
+      e.begin(),
+        e.steer(t, o, a, i.grip),
+        e.separate(t, i.separation, 0.45),
+        e.move(t, s, a * 1.6),
+        e.passed(t) && e.reenter(t),
+        e.face(t, s, 2, o),
+        t.glide < 0.5 &&
+          n > t.glideUntil &&
+          Math.random() < 0.25 * i.glide * s &&
+          (t.glideUntil = n + F(1, 2.5)),
+        (t.glide +=
+          ((n < t.glideUntil ? 1 : 0) - t.glide) * Math.min(1, s * 3)),
+        (t.phase += s * B * 1.25 * i.wingbeat * t.pace * (1 - 0.92 * t.glide));
+    },
+    draw(t, e, s) {
+      s.tuning.foldFlap ? Ps(t) : Hs(t);
+      const i = t.span * (1 + 0.025 * Y.lift),
+        n = e.ink,
+        a = {
+          x: t.x,
+          y: t.y,
+          heading: t.heading,
+          span: i,
+          depth: t.depth,
+          id: t.id,
+        },
+        o = Math.max(0.018, (e.cw * 0.45) / i),
+        r = Math.max(0.032, (e.cw * 0.6) / i);
+      for (const h of [-1, 1])
+        e.lineBody(a, -0.2, 0.014 * h, -0.62, 0.022 * h, Fs);
+      if (
+        (e.lineBody(a, 0.47, 0, 0.6, 0, Ls),
+        e.shape(
+          a,
+          0.66,
+          (h, l) => {
+            const c = Math.abs(l);
+            if (Math.hypot(h - 0.44, c) < r) return w(n, ...ve, V);
+            if (h > 0.12 && h < 0.43 && c < o)
+              return h > 0.28 ? w(n, ...ks, V) : w(n, ...ft);
+            if (
+              ne(
+                h,
+                c,
+                -0.19,
+                0,
+                0.08,
+                0.045 + 0.4 * Math.max(0, -0.12 - h) ** 1.2,
+              )
+            )
+              return w(n, ...ft);
+            if (ne(h, c, 0, 0, 0.16, 0.055)) return w(n, ...ft);
+            if (c <= lt) return !1;
+            const { u: d, v: u } = Os(h, c);
+            if (!Ts(d, u)) return !1;
+            if (Rt.q < 0.42 && Rt.s < 0.7) return w(n, ...ve, V);
+            const b = 0.9 + 0.1 * Rt.q;
+            return w(n, ft[0] * b, ft[1] * b, ft[2] * b, xt);
+          },
+          { light: 0.82 + 0.18 * Y.arm },
+        ),
+        e.toWorld(a, 0.445, 0, yt),
+        e.spot(yt.x, yt.y, "@", [255, 214, 200], Es, t.depth),
+        0.064 * i >= e.cw * 1.2)
+      ) {
+        const h = Math.max(0.032, e.cw / i);
+        for (const l of [-1, 1])
+          e.toWorld(a, 0.44, h * l, yt),
+            e.spot(yt.x, yt.y, "●", As, Is, t.depth);
       }
-      canvas.width = Math.round(world.w * d); canvas.height = Math.round(world.h * d);
-      if (d !== dpr) { dpr = d; atlas = null; grid = null; }
-      settle(); // cell size and bodies follow the window width
+    },
+  },
+  Ft = 6,
+  Ee = {
+    light: {
+      background: [246, 243, 236],
+      grid: [30, 34, 60, 0.07],
+      trailAlpha: 0.7,
+      ink: [42, 42, 59],
+    },
+    dark: {
+      background: [6, 7, 12],
+      grid: [255, 255, 255, 0.055],
+      trailAlpha: 0.85,
+      ink: [150, 160, 200],
+    },
+  },
+  Ie = ".:;+=*%#",
+  Cs = "#%@",
+  Ds = "o*",
+  $s = "8#@",
+  Ns = ".:+*",
+  Bs = ":;",
+  Ws = ".',`",
+  Mt = [
+    [255, 255, 255],
+    [228, 246, 255],
+    [200, 244, 255],
+  ],
+  _s = 0,
+  rt = 1,
+  _t = 2,
+  Kt = [0.25, 0.3, 0.75, 0.3, 0.25, 0.72, 0.75, 0.72];
+function Ae(t) {
+  const e = Math.cos((t * Math.PI) / 180),
+    s = Math.sin((t * Math.PI) / 180);
+  return [
+    0.213 + e * 0.787 - s * 0.213,
+    0.715 - e * 0.715 - s * 0.715,
+    0.072 - e * 0.072 + s * 0.928,
+    0.213 - e * 0.213 + s * 0.143,
+    0.715 + e * 0.285 + s * 0.14,
+    0.072 - e * 0.072 - s * 0.283,
+    0.213 - e * 0.213 - s * 0.787,
+    0.715 - e * 0.715 + s * 0.715,
+    0.072 + e * 0.928 + s * 0.072,
+  ];
+}
+function Us(t, e, s, i, n, a, o = "rgba(30,34,60,0.07)") {
+  t.setTransform(1, 0, 0, 1, 0, 0),
+    (t.strokeStyle = o),
+    (t.lineWidth = 1),
+    t.beginPath();
+  for (let r = 0; r <= Math.ceil(e / i); r++) {
+    const h = Math.round(r * i * a) + 0.5;
+    t.moveTo(h, 0), t.lineTo(h, s * a);
+  }
+  for (let r = 0; r <= Math.ceil(s / n); r++) {
+    const h = Math.round(r * n * a) + 0.5;
+    t.moveTo(0, h), t.lineTo(e * a, h);
+  }
+  t.stroke();
+}
+const Xt = (t, e, s) =>
+    `rgb(${R(Math.round(t), 0, 255)},${R(Math.round(e), 0, 255)},${R(Math.round(s), 0, 255)})`,
+  Tt = (t, e, s) =>
+    (R(Math.round(t), 0, 255) << 16) |
+    (R(Math.round(e), 0, 255) << 8) |
+    R(Math.round(s), 0, 255);
+function ae(t) {
+  let e = t % Math.PI;
+  return (
+    e < 0 && (e += Math.PI),
+    e < Math.PI / 8 || e >= (7 * Math.PI) / 8
+      ? "-"
+      : e < (3 * Math.PI) / 8
+        ? "\\"
+        : e < (5 * Math.PI) / 8
+          ? "|"
+          : "/"
+  );
+}
+class Gs {
+  constructor(e) {
+    S(this, "ink", { r: 0, g: 0, b: 0, kind: 0, glyphs: null, au: 0, av: 0 });
+    S(this, "t", 0);
+    S(this, "theme", "light");
+    S(this, "a", { x: 0, y: 0 });
+    S(this, "b", { x: 0, y: 0 });
+    this.r = e;
+  }
+  get cw() {
+    return this.r.cw;
+  }
+  get ch() {
+    return this.r.ch;
+  }
+  get cols() {
+    return this.r.cols;
+  }
+  get rows() {
+    return this.r.rows;
+  }
+  get contrast() {
+    return this.r.palette.ink;
+  }
+  toWorld(e, s, i, n) {
+    const a = Math.cos(e.heading),
+      o = Math.sin(e.heading);
+    return (
+      (n.x = e.x + (s * a - i * o) * e.span),
+      (n.y = e.y + (s * o + i * a) * e.span),
+      n
+    );
+  }
+  fogFor(e) {
+    return (1 - e) * this.r.tuning.fog;
+  }
+  shape(e, s, i, n = {}) {
+    this.r.shape(e, s, i, n);
+  }
+  line(e, s, i, n, a, o, r, h = this.fogFor(o)) {
+    this.r.line(e, s, i, n, a, h, r);
+  }
+  lineBody(e, s, i, n, a, o, r) {
+    const h = this.toWorld(e, s, i, this.a),
+      l = this.toWorld(e, n, a, this.b);
+    this.r.line(h.x, h.y, l.x, l.y, o, this.fogFor(e.depth), r);
+  }
+  dot(e, s, i, n, a, o = this.fogFor(a)) {
+    this.r.dot(e, s, i, n, o);
+  }
+  spot(e, s, i, n, a, o) {
+    this.r.spot(e, s, i, n, a, this.fogFor(o));
+  }
+  shed(e, s, i) {
+    this.r.shed(e, s, i);
+  }
+  cellIndex(e, s) {
+    return this.r.cellIndex(e, s);
+  }
+}
+class qs {
+  constructor(e, s) {
+    S(this, "cw", 12);
+    S(this, "ch", 18);
+    S(this, "cols", 0);
+    S(this, "rows", 0);
+    S(this, "palette", Ee.light);
+    S(this, "pen", new Gs(this));
+    S(this, "ctx");
+    S(this, "bg");
+    S(this, "dpr", 1);
+    S(this, "width", 0);
+    S(this, "height", 0);
+    S(this, "fontFamily", "ui-monospace, Menlo, monospace");
+    S(this, "theme", "light");
+    S(this, "animal", null);
+    S(this, "energy", new Float32Array(0));
+    S(this, "energyTmp", new Float32Array(0));
+    S(this, "trailStyles", []);
+    S(this, "hue", Ae(0));
+    S(this, "hueOn", !1);
+    S(this, "cellFlag", new Uint8Array(0));
+    S(this, "cellFill", new Uint32Array(0));
+    S(this, "cellColor", new Uint32Array(0));
+    S(this, "cellGlyph", new Uint16Array(0));
+    (this.canvas = e), (this.tuning = s);
+    const i = e.getContext("2d", { alpha: !1 });
+    if (!i) throw new Error("2D canvas unavailable");
+    (this.ctx = i),
+      (this.bg = document.createElement("canvas")),
+      this.setTheme("light");
+  }
+  setFontFamily(e) {
+    e && (this.fontFamily = e);
+  }
+  setTheme(e, p) {
+    // patch (c): p = a palette built from the background tone (default: the named one); on a light one colours are capped
+    (this.theme = e),
+      (this.pen.theme = e),
+      (this.palette = p || Ee[e]),
+      (this.light = e === "light"),
+      (this.cap = this.light ? capOf(this.palette.background) : 1),
+      this.restyle();
+  }
+  setAnimal(e, s) {
+    (this.animal = e), (this.tuning = s), this.energy.fill(0), this.restyle();
+  }
+  restyle() {
+    var o;
+    const e = this.palette,
+      s = ((o = this.animal) == null ? void 0 : o.trail[this.theme]) ?? e.ink;
+    (this.hue = Ae(this.tuning.hueShift)),
+      (this.hueOn = this.tuning.hueShift % 360 !== 0);
+    const [i, n, a] = this.turn(s[0], s[1], s[2]);
+    this.trailStyles = [];
+    for (let r = 0; r < Ft; r++)
+      this.trailStyles.push(
+        `rgba(${i},${n},${a},${((e.trailAlpha * (r + 1)) / Ft).toFixed(3)})`,
+      );
+    this.paintBackground();
+  }
+  turn(e, s, i) {
+    if (this.cap < 1) {
+      // patch (c): a colour brighter than the cap would vanish on a light background: darken it, keeping its hue
+      const l = (0.3 * e + 0.59 * s + 0.11 * i) / 255;
+      l > this.cap && ((e *= this.cap / l), (s *= this.cap / l), (i *= this.cap / l));
     }
-
-    function gridPattern() { // extremely faint grid, one tile repeated
-      if (!grid) {
-        const t = document.createElement('canvas');
-        t.width = gw; t.height = gh;
-        const x = t.getContext('2d');
-        x.fillStyle = look.css; x.fillRect(0, 0, gw, gh); // opaque tile: one fill paints background and grid
-        x.fillStyle = 'rgba(' + look.grid.join(',') + ',' + 0.03 * (s.grid / DEFAULTS.grid) + ')'; // default: ~4 levels over the background (lighter on a dark one, darker on a light one), like the reference
-        if (s.grid > 0) { x.fillRect(0, 0, gw, 1); x.fillRect(0, 0, 1, gh); }
-        grid = ctx.createPattern(t, 'repeat');
+    if (!this.hueOn) return [e, s, i];
+    const n = this.hue;
+    return [
+      n[0] * e + n[1] * s + n[2] * i,
+      n[3] * e + n[4] * s + n[5] * i,
+      n[6] * e + n[7] * s + n[8] * i,
+    ];
+  }
+  fade(e, s, i, n) {
+    const [a, o, r] = this.palette.background;
+    return Tt(e + (a - e) * n, s + (o - s) * n, i + (r - i) * n);
+  }
+  resize(e, s, i) {
+    const n = this.cols,
+      a = this.rows;
+    (this.width = e),
+      (this.height = s),
+      (this.dpr = i),
+      (this.cw = R(Math.round(e / 124 / this.tuning.detail), 5, 24)),
+      (this.ch = Math.round(this.cw * 1.45)),
+      (this.cols = Math.ceil(e / this.cw)),
+      (this.rows = Math.ceil(s / this.ch)),
+      (this.canvas.width = Math.round(e * i)),
+      (this.canvas.height = Math.round(s * i)),
+      (this.bg.width = this.canvas.width),
+      (this.bg.height = this.canvas.height);
+    const o = this.cols * this.rows;
+    (this.cols !== n || this.rows !== a) &&
+      ((this.energy = new Float32Array(o)),
+      (this.energyTmp = new Float32Array(o)),
+      (this.cellFlag = new Uint8Array(o)),
+      (this.cellFill = new Uint32Array(o)),
+      (this.cellColor = new Uint32Array(o)),
+      (this.cellGlyph = new Uint16Array(o))),
+      this.paintBackground();
+  }
+  paintBackground() {
+    const e = this.bg.getContext("2d");
+    if (!e) return;
+    const { width: s, height: i, dpr: n, cw: a, ch: o } = this;
+    e.setTransform(n, 0, 0, n, 0, 0),
+      (e.fillStyle = Xt(...this.palette.background)),
+      e.fillRect(0, 0, s, i);
+    const [r, h, l, c] = this.palette.grid;
+    Us(
+      e,
+      s,
+      i,
+      a,
+      o,
+      n,
+      `rgba(${r},${h},${l},${(c * this.tuning.grid).toFixed(3)})`,
+    );
+  }
+  render(e, s) {
+    const { ctx: i, dpr: n, cols: a, ch: o } = this;
+    if (a === 0) return;
+    this.pen.t = e.time;
+    for (const h of e.events) this.stamp(h.x, h.y, h.radius, h.amount);
+    (e.events.length = 0), this.diffuse(s), this.cellFlag.fill(_s);
+    const r = e.animal;
+    if (r.drawAll) r.drawAll(e, this.pen);
+    else if (r.draw) for (const h of e.creatures) r.draw(h, this.pen, e);
+    i.setTransform(1, 0, 0, 1, 0, 0),
+      i.drawImage(this.bg, 0, 0),
+      i.setTransform(n, 0, 0, n, 0, 0),
+      this.drawTrail(e.time),
+      (i.font = `600 ${Math.round(o * 0.74)}px ${this.fontFamily}`),
+      (i.textAlign = "center"),
+      (i.textBaseline = "middle"),
+      this.drawCells();
+  }
+  cellIndex(e, s) {
+    const i = Math.floor(e / this.cw),
+      n = Math.floor(s / this.ch);
+    return i < 0 || n < 0 || i >= this.cols || n >= this.rows
+      ? -1
+      : n * this.cols + i;
+  }
+  shed(e, s, i) {
+    const n = this.cellIndex(e, s);
+    n >= 0 &&
+      (this.energy[n] = Math.min(1.6, this.energy[n] + i * this.tuning.trail));
+  }
+  stamp(e, s, i, n) {
+    const a = this.energy,
+      o = Math.floor(e / this.cw),
+      r = Math.floor(s / this.ch);
+    for (let h = r - i; h <= r + i; h++)
+      for (let l = o - i; l <= o + i; l++) {
+        if (l < 0 || h < 0 || l >= this.cols || h >= this.rows) continue;
+        const c = Math.hypot(l - o, (h - r) * 1.4);
+        if (c > i + 0.5) continue;
+        const d = h * this.cols + l;
+        a[d] = Math.min(1.6, a[d] + n * (1 - c / (i + 1)));
       }
-      return grid;
+  }
+  diffuse(e) {
+    const { cols: s, rows: i, energy: n, energyTmp: a } = this,
+      o = Math.exp(-e * this.tuning.trailFade);
+    for (let r = 0; r < i; r++)
+      for (let h = 0; h < s; h++) {
+        const l = r * s + h,
+          c = h > 0 ? n[l - 1] : n[l],
+          d = h < s - 1 ? n[l + 1] : n[l],
+          u = r > 0 ? n[l - s] : n[l],
+          b = r < i - 1 ? n[l + s] : n[l];
+        a[l] = (n[l] * 4 + c + d + u + b) * 0.125 * o;
+      }
+    (this.energy = a), (this.energyTmp = n);
+  }
+  drawTrail(e) {
+    const { ctx: s, cols: i, cw: n, ch: a, energy: o, cellFlag: r } = this,
+      h = Math.max(2, Math.round(n * 0.19));
+    for (let l = 0; l < Ft; l++) {
+      s.fillStyle = this.trailStyles[l];
+      for (let c = 0; c < o.length; c++) {
+        const d = o[c];
+        if (d < 0.12 || r[c] === rt) continue;
+        const u = c % i,
+          b = (c / i) | 0,
+          g = 0.75 + 0.25 * Math.sin(e * 5 + W(u, b, 3) * 40);
+        if (R(Math.floor(d * g * 4 * Ft) - 1, 0, Ft - 1) !== l) continue;
+        const p = d > 0.6 ? h + 1 : h;
+        s.fillRect(
+          Math.round(u * n + n * 0.5 - p / 2),
+          Math.round(b * a + a * 0.6 - p / 2),
+          p,
+          p,
+        );
+      }
     }
-
-    const drawCell = (a, gx, gy, code) => atlas.draw(ctx, atlas.get(code, a.lvl, variantOf(world, a, gx, gy, code)), gx, gy);
-    function draw() {
-      const sp = SPECIES[world.animal], cw = world.cw, ch = world.ch;
-      if (!atlas) atlas = makeAtlas(sp, gw, gh, world.levels, s.hue, look);
-      ctx.setTransform(1, 0, 0, 1, 0, 0); // device pixels: every cell lands on whole pixels
-      ctx.globalAlpha = 1; ctx.fillStyle = gridPattern(); ctx.fillRect(0, 0, canvas.width, canvas.height);
-      if (world.trail) { // faint dotted wake: Trail sets its length, Trail fade how fast old dots fade
-        for (const a of world.animals) {
-          const i = atlas.get(enc(BARE, sp.trailCol, PERIOD), Math.min(4, a.lvl + 1), 0), n = a.trail.length;
-          for (let j = 0; j < n - 1; j++) {
-            const p = a.trail[j];
-            if (H(j, Math.floor(p.x), a.seed) >= 0.5) continue;
-            ctx.globalAlpha = (Math.exp(-(world.t - p.t) * world.trailFade) * (j + 1)) / n;
-            atlas.draw(ctx, i, Math.floor(p.x / cw), Math.floor(p.y / ch));
+  }
+  probe(e, s, i, n, a, o) {
+    const r = this.pen.ink,
+      h = a - s.x,
+      l = o - s.y,
+      c = (h * i + l * n) / s.span,
+      d = (l * i - h * n) / s.span;
+    return (r.glyphs = null), (r.au = c), (r.av = d), e(c, d, a, o);
+  }
+  shape(
+    e,
+    s,
+    i,
+    { light: n = 1, tilt: a = 0, fog: o = (1 - e.depth) * this.tuning.fog },
+  ) {
+    const {
+        cellFlag: r,
+        cellFill: h,
+        cellColor: l,
+        cellGlyph: c,
+        cw: d,
+        ch: u,
+        cols: b,
+        rows: g,
+      } = this,
+      p = this.pen.ink,
+      k = this.pen.t,
+      { shimmer: M, sparkle: y } = this.tuning,
+      f = e.span,
+      m = Math.cos(e.heading),
+      E = Math.sin(e.heading),
+      x = s * f,
+      v = Math.max(0, Math.floor((e.x - x) / d)),
+      L = Math.min(b - 1, Math.floor((e.x + x) / d)),
+      C = Math.max(0, Math.floor((e.y - x) / u)),
+      D = Math.min(g - 1, Math.floor((e.y + x) / u));
+    for (let N = C; N <= D; N++)
+      for (let J = v; J <= L; J++) {
+        const A = J * d,
+          _ = N * u,
+          U = this.probe(i, e, m, E, A + d / 2, _ + u / 2);
+        let I = U ? 1 : 0,
+          T = p.r,
+          O = p.g,
+          H = p.b;
+        const P = p.kind,
+          z = p.glyphs,
+          Q = p.au,
+          at = p.av;
+        for (let st = 0; st < Kt.length; st += 2)
+          this.probe(i, e, m, E, A + Kt[st] * d, _ + Kt[st + 1] * u) &&
+            (I === 0 && ((T = p.r), (O = p.g), (H = p.b)), I++);
+        if (I === 0) continue;
+        const it = I / 5,
+          $ = N * b + J,
+          ot = U && it >= 0.6;
+        if (!ot && r[$] === rt) continue;
+        [T, O, H] = this.turn(T, O, H);
+        let $t = n * (1 + (W(J, N, Math.floor(k * 6)) - 0.5) * 0.06);
+        ot &&
+          P === wt &&
+          ($t *=
+            1 -
+            0.4 * M +
+            M * Math.sin(k * 2.2 + Q * 9 + at * 6 + a + e.heading * 2)),
+          (T *= $t),
+          (O *= $t),
+          (H *= $t);
+        const et =
+          (W(
+            Math.round((Q * f) / (d * 0.9)),
+            Math.round((at * f) / (d * 0.9)),
+            e.id,
+          ) *
+            4294967295) >>>
+          0;
+        if (!ot) {
+          const st = it >= 0.5 ? Bs : Ws;
+          (r[$] = _t),
+            (l[$] = this.fade(T, O, H, Math.min(1, o + 0.55 - 0.45 * it))),
+            (c[$] = st.charCodeAt((et >>> 8) % st.length));
+          continue;
+        }
+        if (P === pt) {
+          if (r[$] === rt) continue;
+          const st = (0.3 * T + 0.59 * O + 0.11 * H) / 255,
+            mt = z ?? Ns;
+          (r[$] = _t),
+            (l[$] = this.fade(T, O, H, o)),
+            (c[$] = mt.charCodeAt(
+              z
+                ? (et >>> 8) % mt.length
+                : R(Math.floor(st * mt.length), 0, mt.length - 1),
+            ));
+          continue;
+        }
+        r[$] = rt;
+        const qt = W(et, Math.floor(k * 2.4 + (et % 997) / 97), 7);
+        let K, bt, vt, St;
+        if (P === Dt) {
+          (h[$] = this.fade(T, O, H, Math.min(1, 0.62 + o * 0.38))),
+            (K = z ?? Ie),
+            (l[$] = this.fade(T, O, H, o)),
+            (c[$] = K.charCodeAt((et >>> 8) % K.length)),
+            qt < y && (l[$] = Tt(...(this.light ? LIGHT_SPARKLE : Mt)[et % Mt.length])); // patch (c)
+          continue;
+        }
+        if (P === X) {
+          (h[$] = this.fade(T * 0.58, O * 0.58, H * 0.58, o)),
+            (K = z ?? ".:*"),
+            (l[$] =
+              qt < y
+                ? Tt(...Mt[et % Mt.length])
+                : this.fade(
+                    Math.min(255, T * 1.05 + 50),
+                    Math.min(255, O * 1.05 + 50),
+                    Math.min(255, H * 1.05 + 50),
+                    o,
+                  )),
+            (c[$] = K.charCodeAt((et >>> 8) % K.length));
+          continue;
+        }
+        const Nt = this.fade(T, O, H, o);
+        h[$] = Nt;
+        const kt = Nt >>> 16,
+          Et = (Nt >>> 8) & 255,
+          It = Nt & 255;
+        P === ze
+          ? ((K = z ?? $s),
+            ([bt, vt, St] = this.light // patch (c)
+              ? [kt * 0.42, Et * 0.42, It * 0.42]
+              : [kt * 1.6 + 44, Et * 1.6 + 40, It * 1.6 + 36]))
+          : P === V
+            ? ((K = z ?? Cs),
+              ([bt, vt, St] = this.light // patch (c)
+                ? [kt * 0.42, Et * 0.42, It * 0.42]
+                : [kt * 1.7 + 34, Et * 1.7 + 30, It * 1.7 + 30]))
+            : P === Ye
+              ? ((K = z ?? Ds), ([bt, vt, St] = [kt * 0.4, Et * 0.4, It * 0.4]))
+              : ((K = z ?? Ie),
+                ([bt, vt, St] = [kt * 0.42, Et * 0.42, It * 0.42]));
+        let Yt;
+        if (z || (P !== xt && P !== wt))
+          Yt = K.charCodeAt((et >>> 8) % K.length);
+        else {
+          const st = (0.3 * kt + 0.59 * Et + 0.11 * It) / 255,
+            mt = ((et >>> 4) % 3) - 1;
+          Yt = K.charCodeAt(
+            R(Math.floor((1 - st) * (K.length - 0.01)) + mt, 0, K.length - 1),
+          );
+        }
+        c[$] = Yt;
+        const je = P === wt ? y : P === xt ? y / 3 : 0;
+        l[$] = qt < je ? Tt(...Mt[et % Mt.length]) : Tt(bt, vt, St);
+      }
+  }
+  line(e, s, i, n, a, o, r) {
+    const { cellFlag: h, cellColor: l, cellGlyph: c, cw: d } = this,
+      [u, b, g] = this.turn(a[0], a[1], a[2]),
+      p = this.fade(u, b, g, o),
+      k = ae(Math.atan2(n - s, i - e)).charCodeAt(0),
+      M = Math.max(1, Math.ceil(Math.hypot(i - e, n - s) / (d * 0.5)));
+    let y = -1;
+    for (let f = 1; f <= M; f++) {
+      const m = this.cellIndex(e + ((i - e) * f) / M, s + ((n - s) * f) / M);
+      m < 0 || h[m] === rt || ((h[m] = _t), (l[m] = p), (c[m] = k), (y = m));
+    }
+    r && y >= 0 && (c[y] = r.charCodeAt(0));
+  }
+  dot(e, s, i, n, a) {
+    const o = this.cellIndex(e, s);
+    if (o < 0 || this.cellFlag[o] === rt) return;
+    const [r, h, l] = this.turn(n[0], n[1], n[2]);
+    (this.cellFlag[o] = _t),
+      (this.cellColor[o] = this.fade(r, h, l, a)),
+      (this.cellGlyph[o] = i.charCodeAt(0));
+  }
+  spot(e, s, i, n, a, o) {
+    const r = this.cellIndex(e, s);
+    if (r < 0) return;
+    const [h, l, c] = this.turn(n[0], n[1], n[2]),
+      [d, u, b] = this.turn(a[0], a[1], a[2]);
+    (this.cellFlag[r] = rt),
+      (this.cellFill[r] = this.fade(d, u, b, o)),
+      (this.cellColor[r] = this.fade(h, l, c, o)),
+      (this.cellGlyph[r] = i.charCodeAt(0));
+  }
+  drawCells() {
+    const {
+        ctx: e,
+        cols: s,
+        rows: i,
+        cw: n,
+        ch: a,
+        cellFlag: o,
+        cellFill: r,
+        cellColor: h,
+        cellGlyph: l,
+      } = this,
+      c = s * i;
+    for (let d = 0; d < c; d++) {
+      const u = o[d];
+      if (!u) continue;
+      const b = (d % s) * n,
+        g = ((d / s) | 0) * a;
+      if (u === rt) {
+        const k = r[d];
+        (e.fillStyle = Xt(k >>> 16, (k >>> 8) & 255, k & 255)),
+          e.fillRect(b + 1, g + 1, n - 1, a - 1);
+      }
+      const p = h[d];
+      (e.fillStyle = Xt(p >>> 16, (p >>> 8) & 255, p & 255)),
+        e.fillText(String.fromCharCode(l[d]), b + n / 2, g + a / 2 + 1);
+    }
+  }
+}
+const Ys = {
+    ...gt,
+    fog: 0.26,
+    density: 2.1,
+    sway: 0,
+    spread: 0,
+    farthest: 0.32,
+    farBias: 3,
+    grip: 5,
+    separation: 720,
+    trail: 0.6,
+    trailFade: 1.2,
+    sparkle: 0.18,
+    hover: 1.3,
+    cruising: 0.5,
+    dart: 1.5,
+    wingbeat: 1,
+  },
+  zs = { u: 0.11, v: 0.02, angle: 0.08, length: 0.5, width: 0.062, broad: 0 },
+  Ks = {
+    u: 0.06,
+    v: 0.02,
+    angle: -0.05,
+    length: 0.48,
+    width: 0.07,
+    broad: 0.5,
+  },
+  oe = { s: 0, x: 0 };
+function Xs(t, e, s) {
+  const i = e - t.u,
+    n = s - t.v,
+    a = Math.sin(t.angle),
+    o = Math.cos(t.angle),
+    r = (i * a + n * o) / t.length;
+  if (r < 0 || r > 1) return !1;
+  const h = i * o - n * a,
+    l =
+      t.width *
+      Math.pow(Math.sin(Math.PI * (0.1 + 0.9 * r)), 0.45) *
+      (1 + t.broad * (1 - r) * (1 - r));
+  return Math.abs(h) > l ? !1 : ((oe.s = r), (oe.x = h / l), !0);
+}
+const Xe = [50, 220, 120],
+  Vs = [240, 240, 232],
+  Js = [10, 10, 12],
+  Vt = { x: 0, y: 0 },
+  Zs = [96, 232, 130],
+  Qs = [28, 70, 44],
+  Le = [40, 60, 44],
+  js = [24, 72, 46],
+  tn = [200, 255, 220],
+  en = [18, 40, 28],
+  sn = [236, 168, 70],
+  Jt = [226, 236, 214],
+  nn = [90, 220, 140],
+  an = [176, 70, 40],
+  on = [255, 255, 255],
+  rn = {
+    key: "dragonflies",
+    label: "Dragonfly",
+    swatch: Xe,
+    defaults: Ys,
+    hide: ["shimmer"],
+    controls: [
+      [
+        "Flight",
+        [
+          {
+            key: "hover",
+            label: "Hover time",
+            min: 0.1,
+            max: 4,
+            step: 0.05,
+            hint: "How long they hang in place, on average. Each hover varies a lot: mostly brief, now and then a long one.",
+          },
+          {
+            key: "cruising",
+            label: "Cruising",
+            min: 0,
+            max: 1,
+            step: 0.01,
+            hint: "How often they fly on along the course for a few seconds instead of stopping to hover. Higher means fewer hovers.",
+          },
+          {
+            key: "dart",
+            label: "Dart speed",
+            min: 0.2,
+            max: 3,
+            step: 0.05,
+            hint: "How fast each dart is.",
+          },
+          {
+            key: "wingbeat",
+            label: "Wingbeat",
+            min: 0.2,
+            max: 2,
+            step: 0.05,
+            hint: "How fast the wings flicker.",
+          },
+        ],
+      ],
+    ],
+    area: 15e4,
+    scale: 2.1,
+    speed: 70,
+    trail: { light: [40, 160, 100], dark: [140, 255, 190] },
+    create: (t) => ({ ...t, phase: F(0, B), mode: "hover", until: 0, aim: 0 }),
+    enter(t, e) {
+      (t.mode = "hover"), (t.until = e.time + F(0, 0.6)), (t.aim = e.course);
+    },
+    update(t, e, s) {
+      const i = e.tuning,
+        n = e.time,
+        a = e.cruise(t);
+      if (n >= t.until) {
+        const r = t.mode,
+          h =
+            r === "hover"
+              ? "dart"
+              : r === "dart"
+                ? Math.random() < i.cruising
+                  ? "cruise"
+                  : "hover"
+                : Math.random() < 0.35
+                  ? "dart"
+                  : "hover";
+        (t.mode = h),
+          h === "dart"
+            ? ((t.until = n + F(0.15, 0.45)),
+              r === "cruise" &&
+                (t.aim = t.heading + F(-0.4, 0.4) * (i.spread + 0.2)))
+            : h === "cruise"
+              ? ((t.until = n + F(1.2, 4.5)),
+                (t.aim =
+                  e.heading + t.bias * i.spread + F(-0.5, 0.5) * i.spread))
+              : ((t.until =
+                  n +
+                  Math.min(
+                    3,
+                    Math.max(0.15, -Math.log(1 - Math.random()) * 0.7),
+                  ) *
+                    i.hover),
+                (t.aim =
+                  e.heading +
+                  t.bias * i.spread * 0.5 +
+                  F(-1, 1) * i.spread * 1.6));
+      }
+      const o = e.begin();
+      t.mode === "dart"
+        ? e.steer(t, t.aim, a * 4 * i.dart, 10)
+        : t.mode === "cruise"
+          ? ((t.aim += F(-1, 1) * s * 1.2),
+            (t.aim +=
+              (e.heading + t.bias * i.spread - t.aim) * Math.min(1, s * 0.8)),
+            e.steer(t, t.aim, a * 1.8, 3))
+          : (e.steer(t, e.heading, a * 0.25, 4 * i.grip),
+            (o.x += Math.cos(n * 3 + t.id) * 40),
+            (o.y += Math.sin(n * 4.3 + t.id * 2) * 40)),
+        e.separate(t),
+        e.move(t, s, a * 4.5 * i.dart),
+        e.passed(t) && e.reenter(t),
+        t.mode === "cruise"
+          ? e.face(t, s, 4)
+          : e.face(t, s, t.mode === "dart" ? 14 : 2.5, t.aim),
+        (t.phase += s * B * 7 * i.wingbeat);
+    },
+    startle(t, e, s, i, n) {
+      (t.mode = "dart"),
+        (t.aim = n.heading + t.bias * n.tuning.spread),
+        (t.until = n.time + 0.25 + 0.3 * i),
+        (t.startledUntil = t.until);
+    },
+    draw: (t, e) => hn(t, e),
+  };
+function hn(t, e) {
+  const s = t.span,
+    i = {
+      x: t.x,
+      y: t.y,
+      heading: t.heading,
+      span: s,
+      depth: t.depth,
+      id: t.id,
+    },
+    n = e.ink,
+    a = 0.86 + 0.14 * Math.cos(t.phase),
+    o = 0.86 + 0.14 * Math.cos(t.phase + 1.7),
+    r = e.cw * 0.38,
+    h = Z(t.phase / B),
+    l = Math.floor(e.t * 24);
+  for (const c of [-1, 1])
+    e.lineBody(i, 0.14, 0.03 * c, 0.2, 0.07 * c, Le),
+      e.lineBody(i, 0.1, 0.03 * c, 0.12, 0.08 * c, Le);
+  if (
+    (e.shape(
+      i,
+      0.74,
+      (c, d) => {
+        const u = Math.abs(d),
+          b = (c - 0.12) / 0.07,
+          g = u / 0.046;
+        if (b * b + g * g <= 1)
+          return w(n, ...(Z((c + u) * 22) < 0.5 ? Zs : Qs), X, "#8");
+        if (c < 0.06 && c > -0.74) {
+          const p = Math.max(0.017 - 0.006 * ((0.06 - c) / 0.8), r / s);
+          if (u <= p) {
+            if (c < -0.66) return w(n, ...en, V);
+            const k = Z(c * 20);
+            return k < 0.1
+              ? w(n, ...tn, X, "-")
+              : k < 0.45
+                ? w(n, ...Xe, X, "=")
+                : w(n, ...js, X, ":=");
           }
         }
-        ctx.globalAlpha = 1;
-      }
-      compose(world, drawCell);
-      if (world.pellets.length) {
-        const i = atlas.get(enc(BARE, sp.P.food[0], OH), 0, 0);
-        for (const p of world.pellets) atlas.draw(ctx, i, Math.floor(p.x / cw), Math.floor(p.y / ch));
-      }
-      ctx.fillStyle = look.ripple;
-      const ds = Math.max(1, Math.round(dpr * 1.3));
-      for (const r of world.ripples) { // a disc of tiny grid-aligned dots that grows and fades where you clicked
-        const rad = Math.min(1, r.age / 0.35) * 6, cgx = Math.floor(r.x / cw), cgy = Math.floor(r.y / ch), R = Math.ceil(rad), RX = Math.ceil((rad * ch) / cw);
-        for (let dy = -R; dy <= R; dy++) for (let dx = -RX; dx <= RX; dx++) {
-          const d = Math.hypot(dx * cw, dy * ch) / ch;
-          if (d > rad) continue;
-          ctx.globalAlpha = (1 - r.age / 1.4) * (1 - (d / 6) * 0.7) * 0.55;
-          ctx.fillRect(Math.round((cgx + dx + 0.5) * gw - ds / 2), Math.round((cgy + dy + 0.5) * gh - ds / 2), ds, ds);
+        for (const [p, k] of [
+          [zs, a],
+          [Ks, o],
+        ]) {
+          if (!Xs(p, c, u / k)) continue;
+          const M = d >= 0 ? 1 : -1,
+            y = ae(
+              t.heading + Math.atan2(M * Math.cos(p.angle), Math.sin(p.angle)),
+            ),
+            f = ae(
+              t.heading + Math.atan2(-M * Math.sin(p.angle), Math.cos(p.angle)),
+            ),
+            { s: m, x: E } = oe;
+          if (m > 0.82 && m < 0.9 && E > 0.35) return w(n, ...an, X, "#");
+          if (E > 0.72) return w(n, ...sn, pt, y);
+          if (
+            Math.abs(m - h) < 0.05 &&
+            W(Math.round(c * 60), Math.round(d * 60), l) > 0.45
+          )
+            return w(n, ...on, pt, "*+");
+          const x =
+              Math.abs(E + 0.15) < 0.09 ||
+              Math.abs(E - 0.35) < 0.07 ||
+              E < -0.85 ||
+              m > 0.97,
+            v = Z(m * 9) < 0.09;
+          return x
+            ? w(n, ...Jt, pt, v ? "+" : y)
+            : v
+              ? w(n, ...Jt, pt, f)
+              : m < 0.18
+                ? w(n, ...nn, Dt, ".")
+                : W(Math.round(c * 50), Math.round(d * 50), t.id) > 0.6 &&
+                  w(n, ...Jt, pt, ".");
         }
-      }
-      ctx.globalAlpha = 1;
-    }
-
-    function frame(now) {
-      raf = requestAnimationFrame(frame);
-      if (fps && last && now - last < 1000 / fps - 2) return; // host FPS limit (2 ms slack for timestamp jitter)
-      // step() clamps each call to 50 ms, so a slow rate is stepped in pieces (and a long gap is capped at 200 ms)
-      for (let d = last ? Math.min((now - last) / 1000, 0.2) : 0; d > 0; d -= 0.05) step(world, Math.min(d, 0.05));
-      last = now;
-      draw();
-    }
-
-    resize();
-    window.addEventListener('resize', resize);
-    canvas.addEventListener('pointerdown', (e) => { if (!reduce || SPECIES[world.animal].spine) poke(world, e.clientX, e.clientY); });
-    if (mq && mq.addEventListener) mq.addEventListener('change', (e) => { reduce = e.matches; settle(); });
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) { cancelAnimationFrame(raf); raf = 0; }
-      else if (!raf) { last = 0; raf = requestAnimationFrame(frame); }
-    });
-    if (!document.hidden) raf = requestAnimationFrame(frame);
-
-    return {
-      update(partial) {
-        merge(partial);
-        s = normalize(raw);
-        animal = s.animal;
-        settle(); // drops the atlas and grid when the species or cell size changed
+        return !1;
       },
-      setFps(n) { fps = n > 0 ? n : 0; }, // 0 / undefined = unthrottled
-    };
+      { light: 0.92 + 0.08 * a },
+    ),
+    0.068 * s >= e.cw)
+  )
+    for (const c of [-1, 1])
+      e.toWorld(i, 0.2, 0.034 * c, Vt),
+        e.spot(Vt.x, Vt.y, "●", Js, Vs, t.depth);
+  t.mode === "dart" && e.shed(t.x, t.y, 0.06 * t.depth);
+}
+const ln = {
+    ...gt,
+    fog: 0,
+    size: 1.2,
+    density: 1.3,
+    sway: 0,
+    spread: 0,
+    farthest: 0.35,
+    farBias: 1.4,
+    separation: 450,
+    trail: 3.45,
+    trailFade: 0.4,
+    shimmer: 0.15,
+    sparkle: 0.05,
+    hop: 1,
+    leap: 0.45,
+    height: 1,
+  },
+  Ut = [104, 184, 76],
+  cn = [92, 164, 66],
+  dn = [30, 70, 30],
+  un = [190, 222, 130],
+  pn = [206, 226, 150],
+  gn = [36, 80, 32],
+  mn = [240, 240, 228],
+  fn = [16, 16, 12],
+  yn = [20, 30, 16],
+  Fe = [120, 190, 90],
+  Mn = [
+    [-0.16, 0.11],
+    [0, 0.22],
+    [-0.19, 0.25],
+    [-0.04, 0.31],
+  ],
+  wn = [
+    [-0.17, 0.09],
+    [-0.38, 0.15],
+    [-0.56, 0.13],
+    [-0.68, 0.15],
+  ],
+  xn = [0.056, 0.04, 0.026],
+  Te = [
+    [0.06, 0.1],
+    [0.09, 0.19],
+    [0.18, 0.2],
+  ],
+  He = [
+    [0.06, 0.1],
+    [0.02, 0.16],
+    [-0.06, 0.15],
+  ],
+  bn = [
+    [0.08, 0.11],
+    [0.16, 0.19],
+    [0.27, 0.19],
+  ],
+  vn = [0.028, 0.022],
+  Pe = [0.18, 0.1],
+  Zt = (t, e, s) =>
+    t.map(([i, n], a) => [nt(i, e[a][0], s), nt(n, e[a][1], s)]);
+function Sn(t, e) {
+  const s = 0.155 * Math.sqrt(Math.max(0, 1 - ((t + 0.1) / 0.18) ** 2));
+  let i = 0.15 * e * Math.sqrt(Math.max(0, 1 - ((t - 0.12) / 0.18) ** 2));
+  return t > 0.18 && (i *= 1 - 0.5 * ((t - 0.18) / 0.12) ** 2), Math.max(s, i);
+}
+function Oe(t, e, s, i) {
+  for (let n = 0; n < t.length - 1; n++) {
+    const [a, o] = t[n],
+      [r, h] = t[n + 1];
+    if (Ke(s, i, a, o, r, h) <= e[n] * (1 - 0.25 * Ot.t))
+      return (Ot.t = (n + Ot.t) / (t.length - 1)), !0;
   }
+  return !1;
+}
+const Ht = { x: 0, y: 0 },
+  Re = 0.35,
+  kn = [1, 0.8, 1.2, 0.65, 1.35],
+  En = {
+    key: "frogs",
+    label: "Frog",
+    swatch: [104, 184, 76],
+    defaults: ln,
+    hide: ["grip"],
+    controls: [
+      [
+        "Leaping",
+        [
+          {
+            key: "hop",
+            label: "How often",
+            min: 0.2,
+            max: 4,
+            step: 0.05,
+            hint: "How often they leap.",
+          },
+          {
+            key: "leap",
+            label: "Leap length",
+            min: 0.3,
+            max: 2.5,
+            step: 0.05,
+            hint: "How far each leap goes.",
+          },
+          {
+            key: "height",
+            label: "Leap height",
+            min: 0,
+            max: 2.5,
+            step: 0.05,
+            hint: "How high each leap arcs: they draw bigger at the top and the shadow slides further away.",
+          },
+        ],
+      ],
+    ],
+    area: 75e3,
+    scale: 0.95,
+    speed: 80,
+    trail: { light: [80, 150, 170], dark: [110, 200, 220] },
+    create: (t) => ({
+      ...t,
+      leaping: !1,
+      until: 0,
+      aim: 0,
+      s: 0,
+      dur: 0.5,
+      fromX: 0,
+      fromY: 0,
+      toX: 0,
+      toY: 0,
+    }),
+    enter(t, e) {
+      (t.leaping = !1),
+        (t.s = 0),
+        (t.vx = 0),
+        (t.vy = 0),
+        (t.aim = e.heading + t.bias * e.tuning.spread),
+        (t.heading = t.aim),
+        (t.until = e.time + F(0, 1.5));
+    },
+    update(t, e, s) {
+      const i = e.tuning,
+        n = e.time;
+      if (!t.leaping) {
+        (t.vx = 0),
+          (t.vy = 0),
+          e.face(t, s, 2.5, t.aim),
+          n >= t.until && Ce(t, e, t.aim, 1);
+        return;
+      }
+      if (((t.s += s / t.dur), t.s >= 1)) {
+        (t.leaping = !1),
+          (t.x = t.toX),
+          (t.y = t.toY),
+          (t.vx = 0),
+          (t.vy = 0),
+          (t.until = n + F(0.5, 2.2) / (i.hop * i.speed)),
+          (t.aim = e.heading + (t.bias + F(-0.7, 0.7)) * i.spread),
+          e.events.push({
+            x: t.x,
+            y: t.y,
+            radius: 2,
+            amount: 0.7 * t.depth * i.trail,
+          }),
+          e.passed(t) && e.reenter(t);
+        return;
+      }
+      (t.x = nt(t.fromX, t.toX, t.s)), (t.y = nt(t.fromY, t.toY, t.s));
+    },
+    startle(t, e, s, i, n) {
+      t.leaping ||
+        (Ce(t, n, Math.atan2(s, e), 1 + i, !1),
+        (t.startledUntil = n.time + t.dur));
+    },
+    draw: (t, e, s) => In(t, e, s),
+  };
+function Ce(t, e, s, i, n = !0) {
+  const a = e.tuning;
+  n && (s = e.heading + R(dt(e.heading, s), -Re, Re));
+  const o = Math.cos(s),
+    r = Math.sin(s),
+    h = t.span * F(2.4, 3.6) * a.leap * a.speed * i;
+  let l = h;
+  if (n && a.separation > 0) {
+    let c = -1;
+    for (const d of kn) {
+      const u = t.x + o * h * d,
+        b = t.y + r * h * d;
+      let g = 1 / 0;
+      for (const p of e.creatures) {
+        if (p === t || Math.abs(p.depth - t.depth) > 0.2) continue;
+        const k = p.leaping ? p.toX : p.x,
+          M = p.leaping ? p.toY : p.y;
+        g = Math.min(g, Math.hypot(u - k, b - M) / (t.span + p.span));
+      }
+      if ((g > c && ((c = g), (l = h * d)), g >= 0.6 * (a.separation / 300)))
+        break;
+    }
+  }
+  (t.leaping = !0),
+    (t.s = 0),
+    (t.dur = F(0.42, 0.55) * Math.sqrt(a.leap) * (i > 1 ? 0.8 : 1)),
+    (t.heading = s),
+    (t.fromX = t.x),
+    (t.fromY = t.y),
+    (t.toX = t.x + o * l),
+    (t.toY = t.y + r * l),
+    (t.vx = (t.toX - t.fromX) / t.dur),
+    (t.vy = (t.toY - t.fromY) / t.dur);
+}
+function In(t, e, s) {
+  const i = s.tuning,
+    n = t.leaping ? t.s : 0,
+    a = 4 * n * (1 - n) * i.height,
+    o = t.span * (1 + 0.35 * a),
+    r = {
+      x: t.x,
+      y: t.y,
+      heading: t.heading,
+      span: o,
+      depth: t.depth,
+      id: t.id,
+    },
+    h = e.ink,
+    l = t.leaping ? ht(0, 0.16, n) * (1 - ht(0.72, 1, n)) : 0,
+    c = Zt(Mn, wn, l),
+    d = t.leaping
+      ? n < 0.6
+        ? Zt(Te, He, ht(0, 0.2, n))
+        : Zt(He, bn, ht(0.6, 0.95, n))
+      : Te,
+    u = t.leaping ? 1 : 1 + 0.045 * Math.sin(e.t * 6 + t.id),
+    b = !t.leaping && Z(e.t * 0.21 + t.id * 0.37) < 0.035;
+  for (const g of [-1, 1]) {
+    const p = (k, M, y, f, m) => {
+      const E = Math.atan2(M[1] - k[1], M[0] - k[0]);
+      for (let x = 0; x < y; x++) {
+        const v = E + (x / (y - 1) - 0.5) * m;
+        e.lineBody(
+          r,
+          M[0],
+          M[1] * g,
+          M[0] + Math.cos(v) * f,
+          (M[1] + Math.sin(v) * f) * g,
+          Fe,
+        );
+      }
+    };
+    p(c[2], c[3], 4, 0.075, 1.2), p(d[1], d[2], 3, 0.045, 1.1);
+  }
+  e.shape(
+    r,
+    0.9,
+    (g, p) => {
+      const k = Math.abs(p),
+        M = Sn(g, u);
+      if (k <= M && g > -0.29 && g < 0.3) {
+        if (Math.abs(k - 0.11) < 0.012 && g > -0.22 && g < 0.14)
+          return w(h, ...pn, X);
+        if (g < 0.1) {
+          if (ie(g, p, 0.085, 0.024, t.id)) return w(h, ...dn, V);
+          if (ie(g, p, 0.085, 0.036, t.id)) return w(h, ...un, X);
+        }
+        const L = 0.9 + 0.2 * (1 - k / Math.max(M, 0.001));
+        return w(h, Ut[0] * L, Ut[1] * L, Ut[2] * L, X);
+      }
+      const [y, f] = c[3],
+        [m, E] = c[2],
+        x = Math.atan2(f - E, y - m),
+        v = Math.atan2(k - f, g - y) - x;
+      return Math.hypot(g - y, k - f) < 0.06 &&
+        Math.abs(Math.atan2(Math.sin(v), Math.cos(v))) < 0.5
+        ? w(h, ...Fe, Dt, ".")
+        : Oe(c, xn, g, k) || Oe(d, vn, g, k)
+          ? Z(Ot.t * 4.5) < 0.3
+            ? w(h, ...gn, V)
+            : w(h, ...cn, X)
+          : !1;
+    },
+    { light: 1 + 0.15 * a },
+  );
+  for (const g of [-1, 1])
+    e.toWorld(r, Pe[0], Pe[1] * g, Ht),
+      b
+        ? e.spot(Ht.x, Ht.y, "-", yn, Ut, t.depth)
+        : e.spot(Ht.x, Ht.y, "●", fn, mn, t.depth);
+}
+const An = {
+    ...gt,
+    speed: 1.05,
+    sway: 0.04,
+    spread: 0.08,
+    farthest: 0.3,
+    farBias: 1.4,
+    grip: 1.4,
+    trail: 0.8,
+    trailFade: 0.6,
+    sparkle: 0.1,
+    pulseRate: 1,
+    pulsePower: 1,
+    pulseGlow: 1,
+    tentacles: 1,
+  },
+  Ln = [255, 168, 230],
+  Fn = [232, 56, 182],
+  Qt = [255, 200, 240],
+  Tn = [255, 214, 244],
+  Hn = [255, 240, 250],
+  Pn = [255, 214, 240],
+  On = [204, 56, 172],
+  Rn = [232, 100, 204],
+  Cn = [255, 170, 226],
+  Dn = 6e3,
+  j = { x: 0, y: 0 },
+  jt = { x: 0, y: 0 },
+  $n = (t, e, s) => [
+    t[0] + (e[0] - t[0]) * s,
+    t[1] + (e[1] - t[1]) * s,
+    t[2] + (e[2] - t[2]) * s,
+  ],
+  Nn = {
+    key: "jellyfish",
+    label: "Jellyfish",
+    swatch: [232, 56, 182],
+    defaults: An,
+    hide: ["shimmer"],
+    controls: [
+      [
+        "Swimming",
+        [
+          {
+            key: "pulseRate",
+            label: "Pulse rate",
+            min: 0.2,
+            max: 3,
+            step: 0.05,
+            hint: "How often the bell pulses.",
+          },
+          {
+            key: "pulsePower",
+            label: "Pulse power",
+            min: 0.2,
+            max: 3,
+            step: 0.05,
+            hint: "How far each pulse pushes it forward.",
+          },
+          {
+            key: "pulseGlow",
+            label: "Pulse glow",
+            min: 0,
+            max: 3,
+            step: 0.05,
+            hint: "How much the bell lights up on each pulse. 0 turns it off.",
+          },
+          {
+            key: "tentacles",
+            label: "Arm length",
+            min: 0,
+            max: 2.5,
+            step: 0.05,
+            hint: "Length of the frilly arms and the thin tentacles.",
+          },
+        ],
+      ],
+    ],
+    area: 95e3,
+    scale: 1.6,
+    speed: 55,
+    trail: { light: [200, 80, 170], dark: [255, 130, 214] },
+    create: (t) => ({ ...t, phase: F(0, B), squeeze: 0, turn: 0 }),
+    update(t, e, s) {
+      const i = e.tuning;
+      t.phase += s * B * 0.6 * i.pulseRate * (0.9 + 0.2 * t.roll);
+      const n = Z(t.phase / B);
+      t.squeeze = n < 0.22 ? ht(0, 0.22, n) : 1 - ht(0.22, 1, n);
+      const a = e.heading + t.bias * i.spread,
+        o = t.heading;
+      (t.heading += R(dt(t.heading, a), -0.6 * i.grip * s, 0.6 * i.grip * s)),
+        (t.turn += (dt(o, t.heading) / s - t.turn) * Math.min(1, s * 3));
+      const r = e.cruise(t),
+        h = e.begin(),
+        l = n < 0.22 ? 6.2 * r * i.pulsePower : 0;
+      (h.x += Math.cos(t.heading) * l - t.vx * 1.4),
+        (h.y += Math.sin(t.heading) * l - t.vy * 1.4),
+        e.separate(t, i.separation, 0.5),
+        e.move(t, s, r * 3),
+        e.passed(t, t.span * 1.4) && e.reenter(t);
+    },
+    startle(t, e, s, i, n) {
+      t.phase = Math.floor(t.phase / B) * B + B;
+      const a = 260 * i * t.depth;
+      (t.vx += Math.cos(t.heading) * a),
+        (t.vy += Math.sin(t.heading) * a),
+        (t.startledUntil = n.time + 0.8);
+    },
+    drawAll(t, e) {
+      _n(t, e);
+      for (const s of t.creatures) Wn(s, e, t);
+    },
+  };
+function Bn(t) {
+  const e = Z(t.phase / B);
+  return e < 0.16 ? ht(0, 0.16, e) : Math.exp(-(e - 0.16) * 4.5);
+}
+function Wn(t, e, s) {
+  const i = s.tuning,
+    n = t.span,
+    a = t.squeeze,
+    o = e.t,
+    r = {
+      x: t.x,
+      y: t.y,
+      heading: t.heading,
+      span: n,
+      depth: t.depth,
+      id: t.id,
+    },
+    h = i.tentacles,
+    l = e.fogFor(t.depth),
+    c = 0.32 * (1 + 0.14 * a),
+    d = 0.3 * (1 - 0.2 * a),
+    u = -0.04,
+    b = R(-t.turn * 0.5, -0.5, 0.5),
+    g = Bn(t) * i.pulseGlow;
+  for (let M = 0; M < 8; M++) {
+    const y = (M / 7 - 0.5) * 2 * d * 0.6;
+    let f = u - 0.02,
+      m = y;
+    const E = 14,
+      x = 1.5 * h * (0.75 + 0.35 * W(t.id, M, 4));
+    for (let v = 1; v <= E; v++) {
+      const L = v / E,
+        C = u - 0.02 - L * x * (1 - 0.12 * a),
+        D =
+          y * (1 - 0.3 * L) +
+          0.04 * Math.sin(t.phase - L * 3.5 + M * 1.3) * L +
+          b * L * L * 0.4;
+      e.toWorld(r, f, m, j),
+        e.toWorld(r, C, D, jt),
+        e.line(
+          j.x,
+          j.y,
+          jt.x,
+          jt.y,
+          Rn,
+          t.depth,
+          void 0,
+          Math.min(0.95, l + 0.45 + 0.35 * L),
+        ),
+        (f = C),
+        (m = D);
+    }
+  }
+  for (let M = 0; M < 4; M++) {
+    const y = (M / 3 - 0.5) * 0.11,
+      f = 26,
+      m = 1.05 * h * (0.8 + 0.3 * W(t.id, M, 7));
+    for (let E = 1; E <= f; E++) {
+      const x = E / f,
+        v = u - x * m,
+        L =
+          y * (1 - 0.4 * x) +
+          0.05 * Math.sin(t.phase * 0.9 - x * 4.5 + M * 1.7) * x +
+          b * x * 0.25,
+        C = 0.055 * (1 - 0.5 * x) * Math.cos(x * 9 + M * 1.3 + o * 0.6),
+        D = Math.min(0.95, l + 0.3 * x);
+      e.toWorld(r, v, L, j),
+        e.dot(
+          j.x,
+          j.y,
+          E % 3 ? ":" : "|",
+          On,
+          t.depth,
+          Math.min(0.95, D + 0.15),
+        );
+      for (const N of [-1, 1])
+        e.toWorld(r, v, L + C * N, j),
+          e.dot(
+            j.x,
+            j.y,
+            "{}~§"[(E + M + (N > 0 ? 1 : 0)) % 4],
+            Pn,
+            t.depth,
+            D,
+          );
+    }
+    e.toWorld(r, u - m, y, j), e.shed(j.x, j.y, 0.015 * t.depth);
+  }
+  const p = e.ink,
+    k = 1.3 * (1 + 0.18 * g);
+  e.shape(
+    r,
+    0.32 * k + 0.1,
+    (M, y) =>
+      Math.hypot((M - u) / (c * k), y / (d * k)) < 1 &&
+      M > u - 0.08 &&
+      w(p, ...Qt, pt, "."),
+    { fog: R(l + 0.55 - 0.3 * g, 0, 0.95) },
+  ),
+    e.shape(
+      r,
+      0.42,
+      (M, y) => {
+        const f = (M - u) / c,
+          m = y / d,
+          E = f * f + m * m,
+          x = u - 0.04 * m * m;
+        if (E > 1 || M < x) {
+          if (Math.abs(m) > 1 || M > x || M < x - 0.04) return !1;
+          const N = 0.04 * Math.sin(Z((m + 1) * 5.5) * Math.PI);
+          return M > x - N && w(p, ...Tn, X, "o");
+        }
+        const v = Math.sqrt(E);
+        if (v > 0.88) return w(p, ...Qt, X, ":;");
+        const L = Math.atan2(m, f);
+        if (f > 0.3) {
+          const N = Math.round(f * 11),
+            J = Math.round(m * 13);
+          if (Math.hypot(f * 11 - N, m * 13 - J) < 0.32 && W(N, J, t.id) > 0.45)
+            return w(p, ...Hn, X, ".'");
+        }
+        if (v > 0.35 && Z((L / Math.PI) * 6) < 0.1) return w(p, ...Qt, X, "|");
+        const C = 0.75 + 0.25 * Math.max(R(f, 0, 1), v * v),
+          D = $n(Fn, Ln, R(f, 0, 1) * 0.8);
+        return w(p, D[0] * C, D[1] * C, D[2] * C, X, " .");
+      },
+      { light: (0.92 + 0.18 * a) * (1 + 0.6 * g) },
+    );
+}
+function _n(t, e) {
+  const { width: s, height: i } = t,
+    n = Math.round((s * i) / Dn),
+    a = e.t;
+  for (let o = 0; o < n; o++) {
+    const r = 3 + 9 * W(o, 3, 1),
+      h = W(o, 1, 1) * s + Math.sin(a * 0.25 + o) * 6,
+      l = (((W(o, 2, 1) * i - a * r) % i) + i) % i,
+      c = 0.5 + 0.5 * Math.sin(a * (0.8 + 1.6 * W(o, 4, 1)) + o),
+      d = W(o, 5, 1) > 0.92;
+    e.dot(
+      h,
+      l,
+      d ? "*" : ".",
+      Cn,
+      1,
+      Math.min(0.95, 0.35 + 0.5 * (1 - c) + (d ? 0 : 0.15)),
+    );
+  }
+}
+const q = 14,
+  Un = {
+    ...gt,
+    fog: 0.64,
+    density: 1.6,
+    speed: 1.6,
+    spread: 0,
+    sway: 0,
+    farthest: 0.33,
+    farBias: 1.3,
+    grip: 2.65,
+    separation: 780,
+    trail: 4,
+    trailFade: 0.4,
+    shimmer: 0.35,
+    sparkle: 0.08,
+    meander: 0.4,
+    foodRange: 200,
+    tailBeat: 1,
+  },
+  Gn = [244, 240, 230],
+  te = [222, 66, 40],
+  De = [34, 34, 40],
+  qn = [238, 182, 64],
+  ee = [236, 124, 44],
+  Yn = [236, 226, 214],
+  Ve = ["kohaku", "sanke", "showa", "ogon", "chagoi"];
+function $e(t) {
+  return t < 0.12
+    ? 0.1 * Math.pow(Math.sin(((t / 0.12) * Math.PI) / 2), 0.6)
+    : t < 0.35
+      ? 0.1 + 0.016 * Math.sin(((t - 0.12) / 0.23) * (Math.PI / 2))
+      : t < 0.82
+        ? 0.116 - 0.088 * ht(0.35, 0.82, t)
+        : 0.028 + ((t - 0.82) / 0.18) * 0.1;
+}
+function Ne(t, e, s) {
+  return (
+    Math.sin(t * 11 + s) * Math.cos(e * 22 + s * 1.3) +
+    0.6 * Math.sin(t * 23 + e * 15 + s * 2.1) +
+    0.35 * Math.sin(t * 5 - s * 0.7)
+  );
+}
+const Je = 14,
+  zn = [232, 178, 104],
+  Kn = [14, 12, 16],
+  Xn = [255, 252, 246],
+  Be = new WeakMap(),
+  Ct = (t) => {
+    let e = Be.get(t);
+    return e || Be.set(t, (e = [])), e;
+  };
+let Ze = 0;
+function Vn(t, e, s) {
+  let i = null,
+    n = s;
+  for (const a of Ct(e)) {
+    const o = Math.hypot(a.x - t.x, a.y - t.y);
+    o < n && ((n = o), (i = a));
+  }
+  return (Ze = i ? 1 - n / s : 0), i;
+}
+const Jn = {
+  key: "koi",
+  label: "Koi",
+  swatch: [244, 196, 44],
+  defaults: Un,
+  controls: [
+    [
+      "Swimming",
+      [
+        {
+          key: "meander",
+          label: "Meander",
+          min: 0,
+          max: 3,
+          step: 0.05,
+          hint: "How much they weave in lazy S-curves.",
+        },
+        {
+          key: "tailBeat",
+          label: "Tail beat",
+          min: 0.2,
+          max: 3,
+          step: 0.05,
+          hint: "How fast and wide the tail swishes.",
+        },
+      ],
+    ],
+    [
+      "Feeding",
+      [
+        {
+          key: "foodRange",
+          label: "Food range",
+          min: 0,
+          max: 500,
+          step: 10,
+          hint: "How close a koi has to be to notice food you drop. The closer it is, the harder it turns and the faster it swims over.",
+        },
+      ],
+    ],
+  ],
+  area: 75e3,
+  scale: 1.15,
+  speed: 50,
+  trail: { light: [90, 140, 190], dark: [110, 170, 220] },
+  create: (t) => ({
+    ...t,
+    nodes: new Float32Array(q * 2),
+    phase: F(0, B),
+    variety: Math.floor(W(t.id, 7, 3) * Ve.length),
+  }),
+  enter(t) {
+    const e = t.span / (q - 1);
+    for (let s = 0; s < q; s++)
+      (t.nodes[s * 2] = t.x - Math.cos(t.heading) * e * s),
+        (t.nodes[s * 2 + 1] = t.y - Math.sin(t.heading) * e * s);
+  },
+  prepare(t, e) {
+    const s = Ct(t);
+    for (const n of s)
+      (n.vx *= Math.exp(-e * 0.8)),
+        (n.vy *= Math.exp(-e * 0.8)),
+        (n.x += n.vx * e),
+        (n.y += n.vy * e);
+    const i = t.time;
+    for (let n = s.length - 1; n >= 0; n--)
+      i - s[n].born > Je && s.splice(n, 1);
+  },
+  tap(t, e, s) {
+    const i = Ct(s),
+      n = 7 + Math.floor(Math.random() * 5);
+    for (let a = 0; a < n; a++) {
+      const o = F(0, B),
+        r = 70 * Math.sqrt(Math.random()),
+        h = {
+          x: t + Math.cos(o) * r,
+          y: e + Math.sin(o) * r,
+          vx: Math.cos(o) * F(4, 14),
+          vy: Math.sin(o) * F(4, 14),
+          born: s.time,
+        };
+      i.push(h), s.events.push({ x: h.x, y: h.y, radius: 1, amount: 0.5 });
+    }
+    i.length > 60 && i.splice(0, i.length - 60);
+  },
+  update(t, e, s) {
+    const i = e.tuning,
+      n = e.time,
+      a = Vn(t, e, i.foodRange),
+      o = a ? 0.25 + 0.75 * Ze : 0;
+    let r = a
+      ? Math.atan2(a.y - t.y, a.x - t.x)
+      : e.heading +
+        t.bias * i.spread +
+        i.meander * 0.6 * Math.sin(n * 0.35 + t.id * 1.7);
+    const h = e.begin();
+    if ((e.separate(t, i.separation, 0.5), h.x || h.y)) {
+      const g = e.cruise(t);
+      r = Math.atan2(Math.sin(r) * g + h.y * 0.3, Math.cos(r) * g + h.x * 0.3);
+    }
+    const l = nt(0.9 * i.grip, 2.6, o) * s;
+    t.heading += R(dt(t.heading, r), -l, l);
+    const c = e.cruise(t) * nt(0.85 + 0.25 * Math.sin(n * 0.5 + t.id), 1.8, o);
+    (t.vx = Math.cos(t.heading) * c),
+      (t.vy = Math.sin(t.heading) * c),
+      (t.x += t.vx * s),
+      (t.y += t.vy * s),
+      (t.phase += s * (2 + c / 25) * i.tailBeat);
+    const d = t.nodes,
+      u = t.span / (q - 1);
+    (d[0] = t.x), (d[1] = t.y);
+    let b = t.heading + Math.PI;
+    for (let g = 1; g < q; g++) {
+      let p = Math.atan2(d[g * 2 + 1] - d[g * 2 - 1], d[g * 2] - d[g * 2 - 2]);
+      (p = b + R(dt(b, p), -0.22, 0.22)),
+        (d[g * 2] = d[g * 2 - 2] + Math.cos(p) * u),
+        (d[g * 2 + 1] = d[g * 2 - 1] + Math.sin(p) * u),
+        (b = p);
+    }
+    if (a && Math.hypot(a.x - t.x, a.y - t.y) < t.span * 0.1 + 6) {
+      const g = Ct(e);
+      g.splice(g.indexOf(a), 1),
+        e.events.push({ x: a.x, y: a.y, radius: 1, amount: 0.7 });
+    }
+    e.passed(t, t.span * 1.3) && e.reenter(t);
+  },
+  drawAll(t, e) {
+    Zn(t, e);
+    for (const s of t.creatures) Qn(s, e, t);
+  },
+};
+function Zn(t, e) {
+  const s = t.time;
+  for (const i of Ct(t)) {
+    const n = (s - i.born) / Je;
+    e.dot(
+      i.x,
+      i.y,
+      n < 0.7 ? "o" : ".",
+      zn,
+      1,
+      Math.min(0.9, Math.max(0, n - 0.5) * 1.6),
+    );
+  }
+}
+function Qn(t, e, s) {
+  const i = s.tuning,
+    n = t.span,
+    a = t.nodes,
+    o = e.ink,
+    r = Ve[t.variety],
+    h = t.id * 1.37,
+    l = e.theme === "light" ? [222, 217, 206] : Gn,
+    c = e.theme === "light" ? [206, 196, 182] : Yn,
+    d = new Float32Array(q * 2),
+    u = new Float32Array(q);
+  for (let y = 0; y < q; y++) {
+    const f = y / (q - 1),
+      m = Math.max(0, y - 1),
+      E = Math.min(q - 1, y + 1);
+    let x = a[m * 2] - a[E * 2],
+      v = a[m * 2 + 1] - a[E * 2 + 1];
+    const L = Math.hypot(x, v) || 1;
+    (x /= L), (v /= L);
+    const C =
+      n *
+      0.06 *
+      Math.pow(f, 1.6) *
+      Math.sin(t.phase - f * 4.5) *
+      Math.min(1.5, i.tailBeat);
+    (d[y * 2] = a[y * 2] - v * C),
+      (d[y * 2 + 1] = a[y * 2 + 1] + x * C),
+      y > 0 &&
+        (u[y] =
+          u[y - 1] +
+          Math.hypot(d[y * 2] - d[y * 2 - 2], d[y * 2 + 1] - d[y * 2 - 1]));
+  }
+  const b = u[q - 1] || 1,
+    g = (q / 2) | 0,
+    p = {
+      x: d[g * 2],
+      y: d[g * 2 + 1],
+      heading: t.heading,
+      span: n,
+      depth: t.depth,
+      id: t.id,
+    },
+    k = 0.8 + 0.2 * Math.sin(t.phase * 0.7);
+  e.shape(p, 0.72, (y, f, m, E) => {
+    let x = 1 / 0,
+      v = 0,
+      L = 0,
+      C = 0;
+    for (let I = 0; I < q - 1; I++) {
+      const T = d[I * 2],
+        O = d[I * 2 + 1],
+        H = d[I * 2 + 2] - T,
+        P = d[I * 2 + 3] - O,
+        z = H * H + P * P || 1,
+        Q = ((m - T) * H + (E - O) * P) / z,
+        at = R(Q, 0, 1),
+        it = Math.sqrt(z);
+      if (I === q - 2 && Q > 1) {
+        const ot = Math.abs(H * (E - O) - P * (m - T)) / it;
+        ot * ot < x &&
+          ((x = ot * ot),
+          (v = 1),
+          (C = ((Q - 1) * it) / n),
+          (L = (ot / n) * (H * (E - O) - P * (m - T) >= 0 ? 1 : -1)));
+        continue;
+      }
+      const $ = (m - T - H * at) ** 2 + (E - O - P * at) ** 2;
+      $ < x &&
+        ((x = $),
+        (v = (u[I] + at * it) / b),
+        (L = (Math.sqrt($) / n) * (H * (E - O) - P * (m - T) >= 0 ? 1 : -1)),
+        (C = 0));
+    }
+    const D = Math.abs(L),
+      N = $e(v);
+    if (((o.au = v), (o.av = L), C > 0)) return !1;
+    const J =
+        v > 0.17 &&
+        v < 0.34 &&
+        D < N + 0.1 * k * Math.sin(((v - 0.17) / 0.17) * Math.PI),
+      A =
+        v > 0.48 &&
+        v < 0.6 &&
+        D < N + 0.05 * Math.sin(((v - 0.48) / 0.12) * Math.PI);
+    if (D > N) return (J || A) && w(o, ...c, Dt, "-=");
+    if (v > 0.82)
+      return v > 0.93 && D < ((v - 0.93) / 0.07) * 0.06
+        ? !1
+        : w(o, ...c, Dt, v > 0.9 ? "/\\" : "=");
+    const _ = Ne(v, L, h) > 0.25,
+      U = D / N;
+    switch (r) {
+      case "kohaku":
+        return _ && v < 0.8 ? w(o, ...te) : w(o, ...l);
+      case "sanke":
+        return W(Math.round(v * 30), Math.round(L * 60), t.id) > 0.9 && v > 0.15
+          ? w(o, ...De, V)
+          : _ && v < 0.8
+            ? w(o, ...te)
+            : w(o, ...l);
+      case "showa":
+        return Ne(v, L, h + 4) > 0.55
+          ? w(o, ...l)
+          : _
+            ? w(o, ...te)
+            : w(o, ...De, V, "%#");
+      case "ogon":
+        return w(o, ...qn, wt);
+      default:
+        return w(o, ee[0] * (1 - 0.15 * U), ee[1] * (1 - 0.15 * U), ee[2], wt);
+    }
+  });
+  const M = $e(0.09) * 0.55 * n;
+  if (2 * M >= e.cw) {
+    const y = 0.09 * b;
+    let f = 0;
+    for (; f < q - 2 && u[f + 1] < y; ) f++;
+    const m = u[f + 1] - u[f] || 1,
+      E = (y - u[f]) / m,
+      x = (d[f * 2 + 2] - d[f * 2]) / m,
+      v = (d[f * 2 + 3] - d[f * 2 + 1]) / m,
+      L = d[f * 2] + x * E * m,
+      C = d[f * 2 + 1] + v * E * m;
+    for (const D of [-1, 1])
+      e.spot(L - v * M * D, C + x * M * D, "●", Xn, Kn, t.depth);
+  }
+  e.shed(d[(q - 2) * 2], d[(q - 2) * 2 + 1], 0.02 * t.depth);
+}
+const ct = {
+    butterflies: gs,
+    koi: Jn,
+    jellyfish: Nn,
+    dragonflies: rn,
+    frogs: En,
+    cranes: Rs,
+    crabs: vs,
+  },
+  jn = Object.keys(ct),
+  Pt = 1 / 60,
+  We = (t) => (typeof t == "string" ? ct[t] : t),
+  _e = 4;
+class ti {
+  constructor(
+    e,
+    { animal: s = "butterflies", count: i, theme: n = "light", palette: pal, tuning: a } = {}, // patch (c): palette
+  ) {
+    S(this, "tuning");
+    S(this, "animal");
+    S(this, "flock");
+    S(this, "renderer");
+    S(this, "count");
+    S(this, "raf", 0);
+    S(this, "last", 0);
+    S(this, "acc", 0);
+    S(this, "visible", !0);
+    S(this, "reducedMotion");
+    S(this, "resizeObserver");
+    S(this, "intersectionObserver");
+    S(this, "disposed", !1);
+    // patch (b): pause while the page is hidden
+    S(this, "onVisibility", () => this.schedule());
+    S(this, "frame", (e) => {
+      // patch (a): host FPS limit (0 = unthrottled)
+      if (this.fps && e - this.last < 1000 / this.fps - 2) {
+        this.raf = requestAnimationFrame(this.frame);
+        return;
+      }
+      const s = Math.min(0.1, (e - this.last) / 1e3);
+      (this.last = e), (this.acc += s);
+      let i = 0;
+      for (; this.acc >= Pt && i < _e; )
+        this.flock.step(Pt), (this.acc -= Pt), i++;
+      i === _e && (this.acc = 0),
+        this.renderer.render(this.flock, s),
+        (this.raf = requestAnimationFrame(this.frame));
+    });
+    S(this, "onMotionPreference", () => {
+      this.reducedMotion.matches
+        ? (cancelAnimationFrame(this.raf), this.drawStill())
+        : this.schedule();
+    });
+    S(this, "onPointerDown", (e) => {
+      if (this.reducedMotion.matches || e.target !== this.canvas) return;
+      const s = this.canvas.getBoundingClientRect();
+      this.flock.startle(e.clientX - s.left, e.clientY - s.top);
+    });
+    var o;
+    (this.canvas = e),
+      (this.count = i),
+      (this.animal = We(s)),
+      (this.tuning = { ...this.animal.defaults, ...a }),
+      (this.flock = new ge(this.animal, this.tuning, i)),
+      (this.renderer = new qs(e, this.tuning)),
+      this.renderer.setFontFamily(getComputedStyle(e).fontFamily),
+      this.renderer.setAnimal(this.animal, this.tuning),
+      this.renderer.setTheme(n, pal), // patch (c)
+      (this.reducedMotion = window.matchMedia // patch (d)
+        ? window.matchMedia("(prefers-reduced-motion: reduce)")
+        : NO_MEDIA),
+      (this.resizeObserver = new ResizeObs(() => this.resize())),
+      this.resizeObserver.observe(e),
+      (this.intersectionObserver = new IntersectionObs(([r]) => {
+        (this.visible = r.isIntersecting), this.schedule();
+      })),
+      this.intersectionObserver.observe(e),
+      this.reducedMotion.addEventListener("change", this.onMotionPreference),
+      document.addEventListener("visibilitychange", this.onVisibility), // patch (b)
+      window.addEventListener("pointerdown", this.onPointerDown, {
+        passive: !0,
+      }),
+      this.resize(),
+      (o = document.fonts) == null ||
+        o.load(`600 16px ${getComputedStyle(e).fontFamily}`).then(() => {
+          !this.disposed && this.reducedMotion.matches && this.drawStill();
+        }),
+      this.schedule();
+  }
+  destroy() {
+    (this.disposed = !0),
+      cancelAnimationFrame(this.raf),
+      this.resizeObserver.disconnect(),
+      this.intersectionObserver.disconnect(),
+      this.reducedMotion.removeEventListener("change", this.onMotionPreference),
+      document.removeEventListener("visibilitychange", this.onVisibility), // patch (b)
+      window.removeEventListener("pointerdown", this.onPointerDown);
+  }
+  setAnimal(e, s) {
+    (this.animal = We(e)),
+      (this.tuning = { ...this.animal.defaults, ...s }),
+      (this.flock = new ge(this.animal, this.tuning, this.count)),
+      this.renderer.setAnimal(this.animal, this.tuning),
+      this.resize();
+  }
+  set(e, s) {
+    (this.tuning[e] = s),
+      e === "detail"
+        ? this.resize()
+        : (e === "hueShift" || e === "grid") && this.renderer.restyle(),
+      this.reducedMotion.matches && this.drawStill();
+  }
+  setTheme(e, p) {
+    this.renderer.setTheme(e, p), this.reducedMotion.matches && this.drawStill(); // patch (c)
+  }
+  resize() {
+    const e = this.canvas.getBoundingClientRect();
+    if (e.width < 1 || e.height < 1) return;
+    const s = Math.min(window.devicePixelRatio || 1, 2);
+    this.renderer.resize(e.width, e.height, s),
+      this.flock.resize(e.width, e.height),
+      this.reducedMotion.matches && this.drawStill();
+  }
+  schedule() {
+    cancelAnimationFrame(this.raf),
+      !(this.disposed || !this.visible || document.hidden || this.reducedMotion.matches) && // patch (b)
+        ((this.last = performance.now()),
+        (this.raf = requestAnimationFrame(this.frame)));
+  }
+  drawStill() {
+    if (this.flock.time < 4) for (let e = 0; e < 240; e++) this.flock.step(Pt);
+    this.renderer.render(this.flock, Pt);
+  }
+}
 
-  const api = { ANIMALS, TWEAKS, DEFAULTS, LIMITS, LIVE, SPECIES, eff, levelsFor, normalize, fromWallpaperProps, countFor, createWorld, configure, step, poke, raster, compose, lineGlyph, hueRotate, cellColor, variantOf, backgroundOf, lookOf, contrast, lumOf, start };
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  else globalThis.AsciiAnimals = api;
+// ================= wrapper (not part of the carried-over code) =================
+
+// ---------- support for the patches above ----------
+// Stand-ins for APIs a host may lack (Wallpaper Engine's browser, node): no motion preference, window resize events, always visible.
+const NO_MEDIA = { matches: false, addEventListener() {}, removeEventListener() {} };
+const ResizeObs =
+  typeof ResizeObserver === "function"
+    ? ResizeObserver
+    : class {
+        constructor(cb) { this.cb = cb; }
+        observe() { window.addEventListener("resize", this.cb); }
+        disconnect() { window.removeEventListener("resize", this.cb); }
+      };
+const IntersectionObs =
+  typeof IntersectionObserver === "function"
+    ? IntersectionObserver
+    : class {
+        observe() {}
+        disconnect() {}
+      };
+// A sparkle on a bare tile is white on a dark background and dark ink on a light one.
+const LIGHT_SPARKLE = [[24, 28, 52], [40, 46, 78], [30, 48, 70]];
+// Colour maths for the background tone (WCAG relative luminance).
+const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+const unlin = (v) => Math.round(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
+const lumOf = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+const contrast = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+// On a light background the renderer darkens any colour brighter than this (a 0-1 luma, like the code that uses it) so
+// that it keeps at least CAP_CONTRAST:1 against the background.
+const CAP_CONTRAST = 2.5;
+function capOf(bg) {
+  const lc = (lumOf(bg) + 0.05) / CAP_CONTRAST - 0.05;
+  return lc <= 0 ? 0 : Math.min(1, Math.pow(lc, 1 / 2.2));
+}
+
+// ---------- background tone ----------
+// Background 0..1 mixes the original dark background toward white (linear in sRGB). At 0 the renderer gets the original
+// dark palette object itself. Above 0 it gets the original light or dark palette (whichever has more contrast for its ink
+// against the background) with the background colour replaced; the light one also switches on the renderer's colour cap.
+// `light` and `adapt` are for host UI drawn over the canvas: `light` flips at luminance 0.179, where black and white
+// contrast equally, and adapt(c) gives colour c (chosen for the original background) the same contrast on this background.
+const WHITE = [255, 255, 255];
+const BASE_BG = Ee.dark.background;
+const BASE_LUM = lumOf(BASE_BG);
+const mixRgb = (c, d, t) => c.map((v, i) => Math.round(v + (d[i] - v) * t));
+const LOOKS = new Map();
+function lookOf(tone) {
+  let look = LOOKS.get(tone);
+  if (look) return look;
+  const rgb = mixRgb(BASE_BG, WHITE, tone), lum = lumOf(rgb), light = lum > 0.1791;
+  const theme = tone === 0 ? "dark" : contrast(Ee.light.ink, rgb) > contrast(Ee.dark.ink, rgb) ? "light" : "dark";
+  look = {
+    tone, rgb, css: "rgb(" + rgb.join(",") + ")", light, lum, theme,
+    palette: tone === 0 ? Ee.dark : Object.assign({}, Ee[theme], { background: rgb }),
+    adapt: tone === 0 ? (c) => c : (c) => {
+      const lc = lumOf(c), cd = Math.max(1, (lc + 0.05) / (BASE_LUM + 0.05));
+      const t = light ? Math.max(0, (lum + 0.05) / cd - 0.05) : Math.min(1, cd * (lum + 0.05) - 0.05); // luminance with the same contrast
+      return c.map((v) => { v = lin(v); return unlin(t > lc ? v + ((1 - v) * (t - lc)) / (1 - lc) : lc ? (v * t) / lc : 0); });
+    },
+  };
+  LOOKS.set(tone, look);
+  return look;
+}
+
+// ---------- settings ----------
+// Settings: { animal, name, background, tuning: { <species>: { <key>: value } }, glass: { <key>: value } }.
+// `tuning` holds only the values that differ from that species' defaults (like the original's storage); an absent key means
+// "the species' default". The schema below is derived from the carried-over definitions (gt, ue, ct), in the order of the
+// original panel: Movement, the species' own groups, Look; shared tweaks the species hides are left out.
+const ANIMALS = Object.keys(ct);
+const LABELS = Object.fromEntries(ANIMALS.map((id) => [id, ct[id].label]));
+const ALIASES = { butterfly: "butterflies", dragonfly: "dragonflies", frog: "frogs", crane: "cranes", crab: "crabs", bird: "cranes" }; // ids of earlier versions
+const TWEAKS = Object.fromEntries(
+  ANIMALS.map((id) => {
+    const sp = ct[id], hidden = new Set(sp.hide || []);
+    const make = (group) => (c) => ({
+      key: c.key, label: c.label, group, type: "toggle" in c ? "toggle" : "range",
+      min: c.min, max: c.max, step: c.step, def: sp.defaults[c.key], hint: c.hint, disabledWhen: c.disabledWhen,
+    });
+    return [id, [
+      ...ue.movement.filter((c) => !hidden.has(c.key)).map(make("Movement")),
+      ...sp.controls.flatMap(([group, cs]) => cs.map(make(group))),
+      ...ue.look.filter((c) => !hidden.has(c.key)).map(make("Look")),
+    ]];
+  }),
+);
+// The new tab's search panel (CSS and SVG only; the same for every species), with the original's defaults.
+const GLASS = [
+  ["blur", "Blur (px)", 0, 30, 0.5, 3.5], ["refraction", "Refraction", 0, 150, 1, 40], ["ripple", "Ripple", 0.001, 0.04, 0.001, 0.007],
+  ["tint", "Tint", 0, 3, 0.05, 0], ["edge", "Edge", 0, 2, 0.05, 0.55], ["radius", "Corner radius", 0, 48, 1, 24], ["width", "Width", 320, 960, 10, 720],
+].map(([key, label, min, max, step, def]) => ({ key, label, group: "Chat glass", type: "range", min, max, step, def }));
+// Ours: the tone of the page behind the animals.
+const BACKGROUND = { key: "background", label: "Background", group: "Look", type: "range", min: 0, max: 1, step: 0.01, def: 0 };
+const DEFAULTS = Object.freeze({ animal: ANIMALS[0], name: "", background: 0, tuning: {}, glass: Object.fromEntries(GLASS.map((g) => [g.key, g.def])) });
+
+const num = (v) => (v == null || typeof v === "boolean" || (typeof v === "string" && !v.trim()) ? NaN : Number(v));
+const clampNum = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const snap = (v, t) => +(Math.round(v / t.step) * t.step).toFixed(4); // to the slider step
+const toBool = (v, d) => {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    if (/^(false|0|no|off)$/i.test(v)) return false;
+    if (/^(true|1|yes|on)$/i.test(v)) return true;
+  }
+  return d;
+};
+// The clamped, step-snapped value of a tweak (a toggle: a boolean); `fallback` when the input is junk.
+function valueOf(t, v, fallback) {
+  if (t.type === "toggle") return toBool(v, fallback);
+  const n = num(v);
+  return Number.isFinite(n) ? snap(clampNum(n, t.min, t.max), t) : fallback;
+}
+const animalOf = (v) => {
+  const id = String(v == null ? "" : v).trim().toLowerCase();
+  return ct[id] ? id : ALIASES[id] || null;
+};
+// Any input shape (chrome.storage, a settings file, settings of an older version) -> a complete, valid settings object.
+// Unknown keys are dropped. Older versions stored flat, relative tweak values (density, speed, hue ...): they do not map onto the
+// per-species model and are discarded; the animal (old ids accepted), the name, the background and the glass values are kept.
+function normalize(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const tuning = {};
+  for (const id of ANIMALS) {
+    const src = r.tuning && typeof r.tuning === "object" && r.tuning[id];
+    if (!src || typeof src !== "object") continue;
+    const diff = {};
+    for (const t of TWEAKS[id]) {
+      if (!(t.key in src)) continue;
+      const v = valueOf(t, src[t.key], t.def);
+      if (v !== valueOf(t, t.def, t.def)) diff[t.key] = v;
+    }
+    if (Object.keys(diff).length) tuning[id] = diff;
+  }
+  const g = r.glass && typeof r.glass === "object" ? r.glass : {};
+  const glass = {};
+  for (const t of GLASS) glass[t.key] = valueOf(t, g[t.key] !== undefined ? g[t.key] : r[t.key], t.def); // flat keys: older versions
+  return {
+    animal: animalOf(r.animal) || DEFAULTS.animal, // 'random' and unknown values -> the default
+    name: String(r.name == null ? "" : r.name).trim().slice(0, 40),
+    background: valueOf(BACKGROUND, r.background, BACKGROUND.def),
+    tuning,
+    glass,
+  };
+}
+// Preview in a plain browser: ?animal=koi&background=0.5&speed=1.4 (a string, URLSearchParams or object). Unlike stored settings,
+// a tweak key here is an absolute value for the chosen animal; glass keys (blur, width ...) work too.
+function fromQuery(query) {
+  const q = query && typeof query === "object" && !(query instanceof URLSearchParams) ? query : Object.fromEntries(new URLSearchParams(query || ""));
+  const animal = animalOf(q.animal) || DEFAULTS.animal, tune = {}, glass = {};
+  for (const t of TWEAKS[animal]) if (q[t.key] !== undefined) tune[t.key] = q[t.key];
+  for (const t of GLASS) if (q[t.key] !== undefined) glass[t.key] = q[t.key];
+  return normalize({ animal, name: q.name, background: q.background, tuning: { [animal]: tune }, glass });
+}
+// Wallpaper Engine has a shorter, species-independent set: density, speed, size, trail, grid and detail are multipliers of the
+// selected species' original defaults (1 = the original look), hueshift is degrees. The result is clamped to the original range.
+// (A species whose default is 0, like the crane's trail, stays at 0 under a multiplier.)
+const WALLPAPER = [
+  ["density", "density", "Density (x original)", 0.1, 3, 0.05, 1, true], ["speed", "speed", "Speed (x original)", 0.2, 3, 0.05, 1, true],
+  ["size", "size", "Size (x original)", 0.4, 2.5, 0.05, 1, true], ["hueshift", "hueShift", "Hue shift (°)", -180, 180, 1, 0, false],
+  ["trail", "trail", "Trail (x original)", 0, 3, 0.05, 1, true], ["grid", "grid", "Grid (x original)", 0, 3, 0.05, 1, true],
+  ["detail", "detail", "ASCII detail (x original)", 0.5, 2, 0.05, 1, true],
+].map(([prop, key, text, min, max, step, def, relative]) => ({ prop, key, text, min, max, step, def, relative }));
+// props: Wallpaper Engine's properties as it sends them ({name: {value}}; plain values work too), all the ones seen so far: it sends
+// only what changed, and a multiplier needs the current species. base: settings the rest comes from (e.g. fromQuery(...)).
+function fromWallpaperProps(props, base) {
+  const b = normalize(base), get = (k) => { const p = props && props[k]; return p && typeof p === "object" ? p.value : p; };
+  const animal = animalOf(get("animal")) || b.animal, tune = Object.assign({}, b.tuning[animal]);
+  for (const w of WALLPAPER) {
+    const v = num(get(w.prop)), t = TWEAKS[animal].find((x) => x.key === w.key);
+    if (Number.isFinite(v) && t) tune[w.key] = clampNum(w.relative ? v * t.def : v, t.min, t.max);
+  }
+  const background = get("background");
+  return normalize({ animal, name: b.name, background: background === undefined ? b.background : background, tuning: Object.assign({}, b.tuning, { [animal]: tune }), glass: b.glass });
+}
+// The background of these settings (any shape normalize accepts): { rgb, css, light, lum, theme, palette, adapt(rgb) }.
+const backgroundOf = (settings) => lookOf(normalize(settings).background);
+
+// ---------- start ----------
+// start(canvas, settings) -> { update(partial), setFps(n), destroy() }. The canvas is sized by CSS and its font-family is the glyph
+// font. update() takes any subset of the settings (top-level keys replace; undefined removes), as chrome.storage change events give.
+function start(canvas, settings) {
+  const raw = {};
+  const merge = (p) => { for (const k in p) if (p[k] === undefined) delete raw[k]; else raw[k] = p[k]; };
+  merge(settings);
+  let s = normalize(raw), look = lookOf(s.background), animal = s.animal;
+  const app = new ti(canvas, { animal, theme: look.theme, palette: look.palette, tuning: s.tuning[animal] });
+  return {
+    update(partial) {
+      merge(partial);
+      s = normalize(raw);
+      const tune = s.tuning[s.animal] || {};
+      if (s.animal !== animal) { animal = s.animal; app.setAnimal(animal, tune); }
+      else for (const t of TWEAKS[animal]) { const v = t.key in tune ? tune[t.key] : t.def; if (app.tuning[t.key] !== v) app.set(t.key, v); } // back to the default counts too
+      const next = lookOf(s.background);
+      if (next !== look) { look = next; app.setTheme(look.theme, look.palette); }
+    },
+    setFps(n) { app.fps = n > 0 ? n : 0; }, // 0 / undefined = unthrottled
+    destroy() { app.destroy(); },
+    app, // for tests
+  };
+}
+
+const api = {
+  ANIMALS, LABELS, TWEAKS, GLASS, BACKGROUND, DEFAULTS, WALLPAPER, normalize, fromQuery, fromWallpaperProps, backgroundOf, lookOf, contrast, lumOf, start,
+  internals: { Flock: ge, Renderer: qs, App: ti, species: ct, palettes: Ee, capOf, CAP_CONTRAST }, // for tests
+};
+if (typeof module !== "undefined" && module.exports) module.exports = api;
+else globalThis.AsciiAnimals = api;
+
 })();
